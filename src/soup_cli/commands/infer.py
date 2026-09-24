@@ -140,6 +140,11 @@ def infer(
             "modelers. Non-HF hubs require the matching SDK (v0.53.10 #152)."
         ),
     ),
+    cuda_graphs: bool = typer.Option(
+        False,
+        "--cuda-graphs",
+        help="Experimental CUDA graph decode for resident, unquantized Qwen2/Llama models.",
+    ),
 ):
     """Run batch inference on a JSONL file of prompts."""
     # v0.53.10 #152 — pre-fetch base from a non-HF hub before any resolution.
@@ -166,6 +171,8 @@ def infer(
     # v0.71.32 — ASR (Whisper) transcription branch. Diverts before the chat
     # model-resolution path; _infer_asr owns its own Whisper load + output.
     if task == "asr":
+        if cuda_graphs is True:
+            raise typer.BadParameter("--cuda-graphs supports text generation only")
         # Validate --asr-task up front: a typo would otherwise be passed to
         # whisper.generate(task=...) and fail INSIDE every row (100k confusing
         # per-row skips instead of one upfront rejection).
@@ -238,6 +245,14 @@ def infer(
     model_obj, tokenizer = _load_model(
         model_target, base, device, trust_remote_code, is_local=(model_kind == "local"),
     )
+    if cuda_graphs is True:
+        from soup_cli.utils.cuda_graphs import cuda_graph_generation_kwargs
+
+        try:
+            cuda_graph_generation_kwargs(model_obj)
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1) from exc
     console.print("[green]Model loaded.[/]\n")
 
     # Output path containment — defence-in-depth (project policy v0.20.0+).
@@ -274,6 +289,7 @@ def infer(
             response, token_count = _generate(
                 model_obj, tokenizer, messages,
                 max_tokens=max_tokens, temperature=temperature,
+                **({"cuda_graphs": True} if cuda_graphs is True else {}),
             )
 
             result = {
@@ -709,6 +725,7 @@ def _load_model(
 
 def _generate(
     model, tokenizer, messages, max_tokens=256, temperature=0.7,
+    cuda_graphs: bool = False,
 ) -> tuple[str, int]:
     """Generate a response from the model. Returns (text, token_count)."""
     import torch
@@ -732,6 +749,10 @@ def _generate(
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
             gen_kwargs["top_p"] = 0.9
+        if cuda_graphs:
+            from soup_cli.utils.cuda_graphs import cuda_graph_generation_kwargs
+
+            gen_kwargs.update(cuda_graph_generation_kwargs(model))
         outputs = model.generate(**gen_kwargs)
 
     new_tokens = outputs[0][input_ids.shape[1]:]

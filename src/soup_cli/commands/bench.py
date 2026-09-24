@@ -78,6 +78,11 @@ def bench(
             "v0.53.9 #28."
         ),
     ),
+    cuda_graphs: bool = typer.Option(
+        False,
+        "--cuda-graphs",
+        help="Experimental CUDA graph decode for resident, unquantized Qwen2/Llama models.",
+    ),
 ) -> None:
     """Run an inference benchmark (speed and memory) on a loaded model."""
     import torch
@@ -120,6 +125,9 @@ def bench(
             )
             raise typer.Exit(2)
         backend_resolved = backend_lower
+
+    if cuda_graphs is True and backend_resolved != "transformers":
+        raise typer.BadParameter("--cuda-graphs requires --backend transformers")
 
     if device == "cpu":
         console.print(
@@ -226,6 +234,15 @@ def bench(
         console.print(f"[red]Failed to load model:[/] {exc}")
         raise typer.Exit(1) from exc
 
+    if cuda_graphs is True:
+        from soup_cli.utils.cuda_graphs import cuda_graph_generation_kwargs
+
+        try:
+            cuda_graph_generation_kwargs(model_obj)
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1) from exc
+
     load_time = time.time() - start_load
     console.print(f"[green]Model loaded in {load_time:.2f}s.[/]\n")
 
@@ -237,7 +254,9 @@ def bench(
     warmup_messages = [{"role": "user", "content": test_prompts[0]}]
     _generate(
         model_obj, tokenizer, warmup_messages,
-        max_tokens=min(max_tokens, 32), temperature=0.0,
+        max_tokens=max_tokens if cuda_graphs is True else min(max_tokens, 32),
+        temperature=0.0,
+        **({"cuda_graphs": True} if cuda_graphs is True else {}),
     )
 
     total_tokens = 0
@@ -253,6 +272,7 @@ def bench(
         _, token_count = _generate(
             model_obj, tokenizer, messages,
             max_tokens=max_tokens, temperature=0.0,
+            **({"cuda_graphs": True} if cuda_graphs is True else {}),
         )
 
         latency = time.time() - start_time
