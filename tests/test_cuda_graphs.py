@@ -10,6 +10,13 @@ import pytest
 from soup_cli.utils import cuda_graphs
 
 
+@pytest.fixture(autouse=True)
+def _validated_torch(monkeypatch):
+    """Every test here runs as if on the validated PyTorch; the gate has its own tests.
+    Without this the suite would depend on whichever torch CI resolved."""
+    monkeypatch.setattr(cuda_graphs, "_installed_torch_version", lambda: "2.14.0+cu130")
+
+
 def _model(device: str = "cuda:0") -> object:
     model_type = type(
         "Qwen2ForCausalLM", (), {"__module__": "transformers.models.qwen2.modeling_qwen2"}
@@ -448,3 +455,55 @@ def test_tiny_llama_unmerged_lora_matches_eager_exactly(monkeypatch):
             )
             torch.testing.assert_close(graphed, normal, rtol=0, atol=0)
     assert captures, "the decode was never captured: generate() ran eager"
+
+
+@pytest.mark.parametrize(
+    "version", ["2.14.0", "2.14.0+cu130", "2.14.0a0+git1234", "2.15.1", "3.0.0"]
+)
+def test_validated_or_newer_torch_passes_the_gate(version):
+    cuda_graphs._require_tested_torch(version)
+
+
+@pytest.mark.parametrize("version", ["2.6.0", "2.13.1+cu126", "1.13.1"])
+def test_older_torch_is_refused_with_the_tested_version_named(version):
+    with pytest.raises(RuntimeError, match=r"PyTorch >= 2\.14 \(validated on 2\.14\.0\)"):
+        cuda_graphs._require_tested_torch(version)
+
+
+@pytest.mark.parametrize("version", ["", "nightly", "two.fourteen"])
+def test_an_unreadable_torch_version_is_refused(version):
+    with pytest.raises(RuntimeError, match="Cannot read the PyTorch version"):
+        cuda_graphs._require_tested_torch(version)
+
+
+def test_generation_kwargs_check_torch_before_the_model_and_registration(monkeypatch):
+    monkeypatch.setattr(cuda_graphs, "_installed_torch_version", lambda: "2.6.0")
+    register = Mock()
+    monkeypatch.setattr(cuda_graphs, "_register_backend", register)
+    broken = _model()
+    broken.training = True  # would raise "eval" if the model were checked first
+    with pytest.raises(RuntimeError, match=r"2\.14"):
+        cuda_graphs.cuda_graph_generation_kwargs(broken)
+    register.assert_not_called()
+
+
+def test_a_changed_cudagraphify_signature_is_an_actionable_error(monkeypatch):
+    import torch
+
+    context = SimpleNamespace(fw_metadata=SimpleNamespace(static_input_indices=[0, 2]))
+    api = SimpleNamespace(
+        torch=torch,
+        tracing_context=SimpleNamespace(try_get=lambda: context),
+        aot_autograd=lambda **kw: lambda graph, inputs: kw["inference_compiler"](graph, inputs),
+        boxed_nop=lambda graph, inputs: object(),
+        find_input_mutations=lambda graph: set(),
+        get_device_node_mapping=lambda graph: {torch.device("cuda:0"): object()},
+        check_devices=lambda devices: None,
+        incompatible_node=lambda graph: None,
+        get_stack_traces=lambda graph: [],
+        get_placeholder_info=lambda graph: [],
+        cudagraphify=Mock(side_effect=TypeError("unexpected keyword argument 'placeholders'")),
+    )
+    monkeypatch.setattr(cuda_graphs, "_load_backend_api", lambda: api)
+    with torch.no_grad(), pytest.raises(RuntimeError, match="API changed.*Omit --cuda-graphs"):
+        cuda_graphs._soup_cudagraphs(SimpleNamespace(graph=object()), [1, 2, 3])

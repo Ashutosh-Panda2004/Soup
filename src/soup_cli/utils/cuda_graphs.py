@@ -10,6 +10,7 @@ the graph pool and copy them on every token.
 from __future__ import annotations
 
 import functools
+import re
 import threading
 from importlib import import_module
 from itertools import chain
@@ -22,6 +23,27 @@ _STOCK_MODELS = {
     "qwen2": ("transformers.models.qwen2.modeling_qwen2", "Qwen2ForCausalLM"),
     "llama": ("transformers.models.llama.modeling_llama", "LlamaForCausalLM"),
 }
+# The private compiler APIs below were validated on this PyTorch only (spec 1.2).
+CUDA_GRAPHS_MIN_TORCH = (2, 14)
+_TESTED_TORCH = "2.14.0"
+_TORCH_RELEASE_RE = re.compile(r"(\d+)\.(\d+)")
+
+
+def _installed_torch_version() -> str:
+    return str(import_module("torch").__version__)
+
+
+def _require_tested_torch(version: str) -> None:
+    """Refuse a PyTorch older than the one these private APIs were validated on."""
+    match = _TORCH_RELEASE_RE.match(version)
+    if match is None:
+        raise RuntimeError(f"Cannot read the PyTorch version {version!r}; omit --cuda-graphs")
+    if (int(match.group(1)), int(match.group(2))) < CUDA_GRAPHS_MIN_TORCH:
+        floor = ".".join(str(part) for part in CUDA_GRAPHS_MIN_TORCH)
+        raise RuntimeError(
+            f"--cuda-graphs needs PyTorch >= {floor} (validated on {_TESTED_TORCH}); "
+            f"this is {version}. Omit --cuda-graphs or upgrade PyTorch"
+        )
 
 
 def _cuda_device_key(device: Any) -> str:
@@ -197,6 +219,7 @@ def cuda_graph_generation_kwargs(model: Any) -> dict[str, Any]:
     code. Graph trees validate static addresses when a request creates a new
     cache. Callers must serialize requests using the same model instance.
     """
+    _require_tested_torch(_installed_torch_version())
     _validate_model(model)
     try:
         from transformers import CompileConfig
@@ -258,17 +281,23 @@ def _soup_cudagraphs(dynamo_model: Any, dynamo_inputs: list[Any], **kwargs: Any)
         if reason:
             raise RuntimeError(f"Cannot capture CUDA decode: {reason}. Omit --cuda-graphs")
         device = next(device for device in devices if device.type == "cuda")
-        compiled = api.cudagraphify(
-            api.boxed_nop(aot_model, aot_inputs),
-            aot_inputs,
-            indices,
-            device_index=device.index,
-            is_backward=False,
-            is_inference=True,
-            stack_traces=api.get_stack_traces(aot_model),
-            placeholders=api.get_placeholder_info(aot_model.graph),
-            mutated_input_idxs=mutated,
-        )
+        try:
+            compiled = api.cudagraphify(
+                api.boxed_nop(aot_model, aot_inputs),
+                aot_inputs,
+                indices,
+                device_index=device.index,
+                is_backward=False,
+                is_inference=True,
+                stack_traces=api.get_stack_traces(aot_model),
+                placeholders=api.get_placeholder_info(aot_model.graph),
+                mutated_input_idxs=mutated,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                f"PyTorch's CUDA graph API changed ({exc}); Soup's backend was validated on "
+                f"{_TESTED_TORCH}. Omit --cuda-graphs"
+            ) from exc
         compiled._boxed_call = True
         return compiled
 
