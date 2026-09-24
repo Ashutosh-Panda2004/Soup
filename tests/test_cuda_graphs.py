@@ -396,9 +396,9 @@ def test_tiny_llama_unmerged_lora_matches_eager_exactly(monkeypatch):
     """THE PROBE (spec 1.1). Mirrors Soup's real load path: fp16 base on CUDA, then
     PEFT, which autocasts the adapter to fp32; the adapter stays unmerged.
 
-    Counts real graph captures: generate() silently runs eager when its auto-compile
-    criteria fail, and an eager run matches eager trivially, so identical tokens
-    alone would not show that anything was captured."""
+    Counts compiles through the backend (cudagraphify_impl calls): generate() silently
+    runs eager when its auto-compile criteria fail, and eager matches eager trivially,
+    so identical tokens alone would not show the backend ran at all."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -454,7 +454,7 @@ def test_tiny_llama_unmerged_lora_matches_eager_exactly(monkeypatch):
                 **kwargs,
             )
             torch.testing.assert_close(graphed, normal, rtol=0, atol=0)
-    assert captures, "the decode was never captured: generate() ran eager"
+    assert captures, "the decode never compiled through the backend: generate() ran eager"
 
 
 @pytest.mark.parametrize(
@@ -487,23 +487,45 @@ def test_generation_kwargs_check_torch_before_the_model_and_registration(monkeyp
     register.assert_not_called()
 
 
-def test_a_changed_cudagraphify_signature_is_an_actionable_error(monkeypatch):
-    import torch
+def test_the_real_cudagraphify_accepts_the_call_the_backend_makes():
+    """cudagraphify_impl only STORES its keyword arguments; the real cudagraphify is
+    called later, inside deferred_cudagraphify, at graph run time in the middle of a
+    generate(). Binding that call at pre-flight is where a drift can be refused cleanly."""
+    from torch._inductor import cudagraph_trees
 
-    context = SimpleNamespace(fw_metadata=SimpleNamespace(static_input_indices=[0, 2]))
-    api = SimpleNamespace(
-        torch=torch,
-        tracing_context=SimpleNamespace(try_get=lambda: context),
-        aot_autograd=lambda **kw: lambda graph, inputs: kw["inference_compiler"](graph, inputs),
-        boxed_nop=lambda graph, inputs: object(),
-        find_input_mutations=lambda graph: set(),
-        get_device_node_mapping=lambda graph: {torch.device("cuda:0"): object()},
-        check_devices=lambda devices: None,
-        incompatible_node=lambda graph: None,
-        get_stack_traces=lambda graph: [],
-        get_placeholder_info=lambda graph: [],
-        cudagraphify=Mock(side_effect=TypeError("unexpected keyword argument 'placeholders'")),
-    )
-    monkeypatch.setattr(cuda_graphs, "_load_backend_api", lambda: api)
-    with torch.no_grad(), pytest.raises(RuntimeError, match="API changed.*Omit --cuda-graphs"):
-        cuda_graphs._soup_cudagraphs(SimpleNamespace(graph=object()), [1, 2, 3])
+    cuda_graphs._require_cudagraphify_signature(cudagraph_trees.cudagraphify)
+
+
+def test_a_drifted_cudagraphify_signature_is_refused_at_pre_flight():
+    def drifted(model, inputs, static_input_idxs=(), *, device_index, is_backward,
+                is_inference, stack_traces=None, mutated_input_idxs=()):
+        raise AssertionError("binding must not call it")  # 'placeholders' was dropped
+
+    with pytest.raises(RuntimeError, match="API changed.*Omit --cuda-graphs"):
+        cuda_graphs._require_cudagraphify_signature(drifted)
+
+
+def test_loading_the_backend_api_checks_the_deferred_signature(monkeypatch):
+    from torch._inductor import cudagraph_trees
+
+    seen = []
+    monkeypatch.setattr(cuda_graphs, "_require_cudagraphify_signature", seen.append)
+    cuda_graphs._load_backend_api()
+    assert seen == [cudagraph_trees.cudagraphify]
+
+
+def test_rejects_a_lora_variant_such_as_alora_or_arrow(monkeypatch):
+    base = _model()
+    variant = SimpleNamespace(training=False, merged=False, lora_variant={"default": object()})
+    base.modules = lambda: iter([base, variant])
+    monkeypatch.setattr(cuda_graphs, "_register_backend", Mock())
+    with pytest.raises(RuntimeError, match="plain LoRA"):
+        cuda_graphs.cuda_graph_generation_kwargs(_peft(base))
+
+
+def test_a_plain_lora_layer_has_an_empty_variant_map_and_passes(monkeypatch):
+    base = _model()
+    plain = SimpleNamespace(training=False, merged=False, lora_variant={})
+    base.modules = lambda: iter([base, plain])
+    monkeypatch.setattr(cuda_graphs, "_register_backend", Mock())
+    assert cuda_graphs.cuda_graph_generation_kwargs(_peft(base))["cache_implementation"] == "static"

@@ -172,7 +172,9 @@ def infer(
     # model-resolution path; _infer_asr owns its own Whisper load + output.
     if task == "asr":
         if cuda_graphs is True:
-            raise typer.BadParameter("--cuda-graphs supports text generation only")
+            raise typer.BadParameter(
+                "--cuda-graphs supports text generation only. Omit --cuda-graphs for --task asr"
+            )
         # Validate --asr-task up front: a typo would otherwise be passed to
         # whisper.generate(task=...) and fail INSIDE every row (100k confusing
         # per-row skips instead of one upfront rejection).
@@ -251,7 +253,7 @@ def infer(
         try:
             cuda_graph_generation_kwargs(model_obj)
         except RuntimeError as exc:
-            console.print(f"[red]{for_terminal(str(exc))}[/]")
+            console.print(f"[red]{for_terminal(_with_omit_hint(str(exc)))}[/]")
             raise typer.Exit(1) from exc
     console.print("[green]Model loaded.[/]\n")
 
@@ -295,7 +297,7 @@ def infer(
                     max_tokens=max_tokens, temperature=temperature,
                     **({"cuda_graphs": True} if cuda_graphs is True else {}),
                 )
-            except RuntimeError as exc:
+            except Exception as exc:
                 if cuda_graphs is not True:
                     raise
                 raise _cuda_graph_failure(exc) from exc
@@ -733,7 +735,7 @@ def _load_model(
 
 def _generate(
     model, tokenizer, messages, max_tokens=256, temperature=0.7,
-    cuda_graphs: bool = False,
+    cuda_graphs: bool = False, min_tokens: int | None = None,
 ) -> tuple[str, int]:
     """Generate a response from the model. Returns (text, token_count)."""
     import torch
@@ -757,6 +759,8 @@ def _generate(
         if temperature > 0:
             gen_kwargs["temperature"] = temperature
             gen_kwargs["top_p"] = 0.9
+        if min_tokens:
+            gen_kwargs["min_new_tokens"] = min_tokens
         if cuda_graphs:
             from soup_cli.utils.cuda_graphs import cuda_graph_generation_kwargs
 
@@ -784,6 +788,13 @@ def _longest_prompt(tokenizer, prompts: list[str]) -> str:
     return max(prompts, key=lambda text: _count_prompt_tokens(tokenizer, text))
 
 
+def _with_omit_hint(message: str) -> str:
+    """Every --cuda-graphs refusal ends by naming the way out."""
+    if "omit --cuda-graphs" in message.lower():
+        return message
+    return f"{message.rstrip('. ')}. Omit --cuda-graphs."
+
+
 def _cuda_graph_failure(exc: BaseException) -> typer.Exit:
     console.print(
         f"[red]Generation failed with --cuda-graphs: {for_terminal(str(exc))}. "
@@ -792,18 +803,25 @@ def _cuda_graph_failure(exc: BaseException) -> typer.Exit:
     return typer.Exit(1)
 
 
+# Graph trees warm up on a compiled function's first call, record on the second and
+# replay from the third; decode forwards are new tokens minus one (prefill is eager).
+_CUDA_GRAPH_WARMUP_TOKENS = 4
+
+
 def _warm_cuda_graphs(model, tokenizer, prompts: list[str], max_tokens: int) -> None:
     """Capture once, on the longest prompt, before any output is written.
 
     Transformers sizes a static cache as max(this request, every earlier one), so
     warming on the longest prompt means no later request changes the cache shape and
-    recompiles. Greedy, so it consumes none of the sampling RNG the real rows use.
+    recompiles. Greedy, so it consumes none of the sampling RNG the real rows use, and
+    held to a few tokens past EOS so the graph is recorded even on a short answer.
     """
-    console.print("[dim]Compiling CUDA graph decode (one-time; the first request is slower)...[/]")
+    console.print("[dim]Compiling CUDA graph decode (a one-time warm-up)...[/]")
     messages = [{"role": "user", "content": _longest_prompt(tokenizer, prompts)}]
     try:
         _generate(
             model, tokenizer, messages, max_tokens=max_tokens, temperature=0.0, cuda_graphs=True,
+            min_tokens=min(max_tokens, _CUDA_GRAPH_WARMUP_TOKENS),
         )
-    except RuntimeError as exc:
+    except Exception as exc:
         raise _cuda_graph_failure(exc) from exc

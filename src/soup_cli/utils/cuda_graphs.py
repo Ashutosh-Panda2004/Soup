@@ -10,6 +10,7 @@ the graph pool and copy them on every token.
 from __future__ import annotations
 
 import functools
+import inspect
 import re
 import threading
 from importlib import import_module
@@ -90,11 +91,19 @@ def _unwrap_peft(model: Any) -> Any:
     if getattr(adapter, "use_dora", False):
         raise RuntimeError("CUDA graph decoding does not support DoRA adapters")
     base = get_base_model()
-    if any(getattr(module, "merged", False) is True for module in base.modules()):
-        raise RuntimeError(
-            "CUDA graph decoding requires an unmerged adapter; merged weights would not "
-            "match normal generation"
-        )
+    for module in base.modules():
+        if getattr(module, "merged", False) is True:
+            raise RuntimeError(
+                "CUDA graph decoding requires an unmerged adapter; merged weights would not "
+                "match normal generation"
+            )
+        # peft keeps {} here for plain LoRA; DoRA, aLoRA, Arrow and QALoRA register a
+        # variant whose forward was never validated under capture.
+        if getattr(module, "lora_variant", None):
+            raise RuntimeError(
+                "CUDA graph decoding supports plain LoRA only; this adapter uses a LoRA "
+                "variant (DoRA, aLoRA, Arrow, ...)"
+            )
     return base
 
 
@@ -172,6 +181,7 @@ def _load_backend_api() -> SimpleNamespace:
         "get_device_node_mapping": ("torch._dynamo.backends.cudagraphs", "get_device_node_mapping"),
         "get_stack_traces": ("torch._dynamo.backends.cudagraphs", "get_stack_traces"),
         "cudagraphify": ("torch._inductor.cudagraph_trees", "cudagraphify_impl"),
+        "cudagraphify_target": ("torch._inductor.cudagraph_trees", "cudagraphify"),
         "check_devices": (
             "torch._inductor.cudagraph_utils",
             "check_multiple_devices_or_any_cpu_nodes",
@@ -198,7 +208,27 @@ def _load_backend_api() -> SimpleNamespace:
             "This PyTorch installation lacks Soup's required CUDA graph compiler APIs; "
             "omit --cuda-graphs or install a compatible PyTorch version"
         ) from exc
+    _require_cudagraphify_signature(values["cudagraphify_target"])
     return SimpleNamespace(**values)
+
+
+def _require_cudagraphify_signature(target: Any) -> None:
+    """Bind, at pre-flight, the call cudagraph trees make only at graph run time.
+
+    cudagraphify_impl stores its keyword arguments and forwards them to cudagraphify
+    inside deferred_cudagraphify, i.e. mid-generate. A drifted keyword would surface
+    there as a bare TypeError; binding the same call here refuses it before any output.
+    """
+    try:
+        inspect.signature(target).bind(
+            None, [], [], device_index=0, is_backward=False, is_inference=True,
+            stack_traces=[], placeholders=[], mutated_input_idxs=set(),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"PyTorch's CUDA graph API changed ({exc}); Soup's backend was validated on "
+            f"{_TESTED_TORCH}. Omit --cuda-graphs"
+        ) from exc
 
 
 def _register_backend() -> None:
@@ -281,23 +311,19 @@ def _soup_cudagraphs(dynamo_model: Any, dynamo_inputs: list[Any], **kwargs: Any)
         if reason:
             raise RuntimeError(f"Cannot capture CUDA decode: {reason}. Omit --cuda-graphs")
         device = next(device for device in devices if device.type == "cuda")
-        try:
-            compiled = api.cudagraphify(
-                api.boxed_nop(aot_model, aot_inputs),
-                aot_inputs,
-                indices,
-                device_index=device.index,
-                is_backward=False,
-                is_inference=True,
-                stack_traces=api.get_stack_traces(aot_model),
-                placeholders=api.get_placeholder_info(aot_model.graph),
-                mutated_input_idxs=mutated,
-            )
-        except TypeError as exc:
-            raise RuntimeError(
-                f"PyTorch's CUDA graph API changed ({exc}); Soup's backend was validated on "
-                f"{_TESTED_TORCH}. Omit --cuda-graphs"
-            ) from exc
+        # These keywords are only bound when the graph first runs (deferred_cudagraphify);
+        # _require_cudagraphify_signature checks them at pre-flight instead.
+        compiled = api.cudagraphify(
+            api.boxed_nop(aot_model, aot_inputs),
+            aot_inputs,
+            indices,
+            device_index=device.index,
+            is_backward=False,
+            is_inference=True,
+            stack_traces=api.get_stack_traces(aot_model),
+            placeholders=api.get_placeholder_info(aot_model.graph),
+            mutated_input_idxs=mutated,
+        )
         compiled._boxed_call = True
         return compiled
 

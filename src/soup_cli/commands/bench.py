@@ -127,7 +127,10 @@ def bench(
         backend_resolved = backend_lower
 
     if cuda_graphs is True and backend_resolved != "transformers":
-        raise typer.BadParameter("--cuda-graphs requires --backend transformers")
+        raise typer.BadParameter(
+            "--cuda-graphs requires --backend transformers. Omit --cuda-graphs to bench this "
+            "backend"
+        )
 
     if device == "cpu":
         console.print(
@@ -240,9 +243,10 @@ def bench(
         try:
             cuda_graph_generation_kwargs(model_obj)
         except RuntimeError as exc:
+            from soup_cli.commands.infer import _with_omit_hint
             from soup_cli.utils.terminal import for_terminal
 
-            console.print(f"[red]{for_terminal(str(exc))}[/]")
+            console.print(f"[red]{for_terminal(_with_omit_hint(str(exc)))}[/]")
             raise typer.Exit(1) from exc
 
     load_time = time.time() - start_load
@@ -282,7 +286,7 @@ def bench(
                 max_tokens=max_tokens, temperature=0.0,
                 **({"cuda_graphs": True} if cuda_graphs is True else {}),
             )
-        except RuntimeError as exc:
+        except Exception as exc:
             if cuda_graphs is not True:
                 raise
             from soup_cli.commands.infer import _cuda_graph_failure

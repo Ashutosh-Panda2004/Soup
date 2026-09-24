@@ -8,11 +8,13 @@ import pytest
 from typer.testing import CliRunner
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Typer draws errors in a Rich panel; a wrapped message line carries its borders.
+_BOX_RE = re.compile("[─-╿]")
 
 
 def _plain(text: str) -> str:
-    """ANSI-stripped, whitespace-collapsed CLI output: Rich colours AND wraps."""
-    return " ".join(_ANSI_RE.sub("", text).split())
+    """ANSI- and border-stripped, whitespace-collapsed CLI output (Rich colours and boxes)."""
+    return " ".join(_BOX_RE.sub(" ", _ANSI_RE.sub("", text)).split())
 
 
 @pytest.mark.parametrize("args", [["infer", "--help"], ["bench", "infer", "--help"]])
@@ -129,6 +131,7 @@ def test_cuda_graphs_reject_asr_before_loading(monkeypatch, tmp_path):
     )
     assert result.exit_code == 2
     assert "text generation only" in _plain(result.output)
+    assert "Omit --cuda-graphs" in _plain(result.output)
     load.assert_not_called()
 
 
@@ -156,6 +159,7 @@ def test_unsupported_graph_model_preserves_existing_output(monkeypatch, tmp_path
     )
     assert result.exit_code == 1
     assert "Unsupported model for CUDA graphs" in _plain(result.output)
+    assert "Omit --cuda-graphs" in _plain(result.output)
     assert output.read_text() == "previous results\n"
     generate.assert_not_called()
 
@@ -183,6 +187,8 @@ def test_infer_warms_up_greedily_on_the_longest_prompt_before_writing(monkeypatc
     assert warm.args[2] == [{"role": "user", "content": "one two three four"}]
     assert warm.kwargs["temperature"] == 0.0
     assert warm.kwargs["cuda_graphs"] is True
+    assert warm.kwargs["min_tokens"] == 4  # warm-up node, recording, replay
+    assert all("min_tokens" not in call.kwargs for call in rows)
     assert [call.kwargs["temperature"] for call in rows] == [0.7, 0.7, 0.7]
     assert len(output.read_text().splitlines()) == 3
 
@@ -235,7 +241,10 @@ def test_a_single_prompt_costs_one_warm_up_plus_the_row(monkeypatch, tmp_path):
     assert len((tmp_path / "output.jsonl").read_text().splitlines()) == 1
 
 
-def test_without_the_flag_nothing_is_warmed_and_errors_propagate_unchanged(monkeypatch, tmp_path):
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
+def test_without_the_flag_nothing_is_warmed_and_errors_propagate_unchanged(
+    monkeypatch, tmp_path, error_type
+):
     from soup_cli.cli import app
     from soup_cli.commands import infer
 
@@ -246,7 +255,7 @@ def test_without_the_flag_nothing_is_warmed_and_errors_propagate_unchanged(monke
     assert spy.call_count == 2
     assert all("cuda_graphs" not in call.kwargs for call in spy.call_args_list)
 
-    boom = RuntimeError("plain failure")
+    boom = error_type("plain failure")
     monkeypatch.setattr(infer, "_generate", MagicMock(side_effect=boom))
     result = CliRunner().invoke(app, _infer_args(model_dir))
     assert result.exception is boom
@@ -302,3 +311,135 @@ def test_bench_without_the_flag_keeps_its_short_warm_up(monkeypatch, tmp_path):
     assert warm.args[2] == [{"role": "user", "content": "short one"}]
     assert warm.kwargs["max_tokens"] == 32
     assert "cuda_graphs" not in warm.kwargs
+
+
+def test_the_hint_is_not_repeated_when_the_refusal_already_carries_it(monkeypatch, tmp_path):
+    from soup_cli.cli import app
+    from soup_cli.commands import infer
+
+    already_hinted = RuntimeError("Cannot read the PyTorch version; omit --cuda-graphs")
+    reject = MagicMock(side_effect=already_hinted)
+    model_dir = _infer_env(monkeypatch, tmp_path, ["question"], MagicMock())
+    monkeypatch.setattr("soup_cli.utils.cuda_graphs.cuda_graph_generation_kwargs", reject)
+    result = CliRunner().invoke(app, _infer_args(model_dir, "--cuda-graphs"))
+    assert result.exit_code == 1
+    assert _plain(result.output).lower().count("omit --cuda-graphs") == 1
+    infer._generate.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [TypeError("cudagraphify() got an unexpected keyword"),
+                                   AssertionError("cudagraph tree invariant")])
+def test_any_error_in_the_warm_up_is_a_named_failure(monkeypatch, tmp_path, error):
+    from soup_cli.cli import app
+
+    output = tmp_path / "output.jsonl"
+    output.write_text("previous results\n")
+    model_dir = _infer_env(monkeypatch, tmp_path, ["question"], MagicMock(side_effect=error))
+    result = CliRunner().invoke(app, _infer_args(model_dir, "--cuda-graphs"))
+    assert result.exit_code == 1
+    assert f"Generation failed with --cuda-graphs: {error}" in _plain(result.output)
+    assert output.read_text() == "previous results\n"
+
+
+def test_any_error_mid_batch_is_a_named_failure_that_keeps_rows(monkeypatch, tmp_path):
+    from soup_cli.cli import app
+
+    outcomes = iter([("warm", 1), ("first", 2), TypeError("deferred cudagraphify drifted")])
+
+    def generate(*args, **kwargs):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    model_dir = _infer_env(
+        monkeypatch, tmp_path, ["q1", "q2", "q3"], MagicMock(side_effect=generate)
+    )
+    result = CliRunner().invoke(app, _infer_args(model_dir, "--cuda-graphs"))
+    assert result.exit_code == 1
+    text = _plain(result.output)
+    assert "Generation failed with --cuda-graphs: deferred cudagraphify drifted" in text
+    lines = (tmp_path / "output.jsonl").read_text().splitlines()
+    assert [json.loads(line)["response"] for line in lines] == ["first"]
+
+
+def test_a_tiny_max_tokens_caps_the_warm_up_minimum(monkeypatch, tmp_path):
+    from soup_cli.cli import app
+
+    spy = MagicMock(return_value=("answer", 2))
+    model_dir = _infer_env(monkeypatch, tmp_path, ["question"], spy)
+    result = CliRunner().invoke(app, _infer_args(model_dir, "--max-tokens", "2", "--cuda-graphs"))
+    assert result.exit_code == 0, (result.output, repr(result.exception))
+    assert spy.call_args_list[0].kwargs["min_tokens"] == 2
+
+
+def test_generate_passes_min_new_tokens_only_when_asked(monkeypatch):
+    import torch
+
+    from soup_cli.commands import infer
+
+    inputs = {"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}
+    monkeypatch.setattr("soup_cli.utils.vllm.encode_chat_prompt", lambda *a, **kw: inputs)
+    model = MagicMock(device=torch.device("cpu"))
+    model.generate.return_value = torch.tensor([[1, 2, 3, 4]])
+    tokenizer = MagicMock(pad_token_id=0)
+    tokenizer.decode.return_value = "answer"
+    messages = [{"role": "user", "content": "question"}]
+    infer._generate(model, tokenizer, messages, max_tokens=8, temperature=0.0, min_tokens=4)
+    assert model.generate.call_args.kwargs["min_new_tokens"] == 4
+    infer._generate(model, tokenizer, messages, max_tokens=8, temperature=0.0)
+    assert "min_new_tokens" not in model.generate.call_args.kwargs
+
+
+def test_bench_refuses_the_flag_off_transformers_with_the_hint(monkeypatch, tmp_path):
+    from soup_cli.cli import app
+
+    load = MagicMock()
+    model_dir = _infer_env(monkeypatch, tmp_path, ["question"], MagicMock())
+    monkeypatch.setattr("soup_cli.commands.infer._load_model", load)
+    result = CliRunner().invoke(
+        app, ["bench", "infer", str(model_dir), "--backend", "mlx", "--cuda-graphs"]
+    )
+    assert result.exit_code == 2
+    text = _plain(result.output)
+    assert "requires --backend transformers" in text
+    assert "Omit --cuda-graphs" in text
+    load.assert_not_called()
+
+
+def test_bench_pre_flight_refusal_carries_the_hint(monkeypatch, tmp_path):
+    from soup_cli.cli import app
+
+    generate = MagicMock()
+    model_dir = _infer_env(monkeypatch, tmp_path, ["question"], generate)
+    reject = MagicMock(side_effect=RuntimeError("Unsupported model for CUDA graphs"))
+    monkeypatch.setattr("soup_cli.utils.cuda_graphs.cuda_graph_generation_kwargs", reject)
+    result = CliRunner().invoke(app, _bench_args(model_dir, "--cuda-graphs"))
+    assert result.exit_code == 1
+    text = _plain(result.output)
+    assert "Unsupported model for CUDA graphs" in text
+    assert "Omit --cuda-graphs" in text
+    generate.assert_not_called()
+
+
+def test_bench_timed_failure_is_named_and_the_default_re_raises(monkeypatch, tmp_path):
+    from soup_cli.cli import app
+    from soup_cli.commands import infer
+
+    outcomes = iter([("warm", 1), TypeError("timed row drifted")])
+
+    def generate(*args, **kwargs):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    model_dir = _infer_env(monkeypatch, tmp_path, ["question"], MagicMock(side_effect=generate))
+    result = CliRunner().invoke(app, _bench_args(model_dir, "--cuda-graphs"))
+    assert result.exit_code == 1
+    assert "Generation failed with --cuda-graphs: timed row drifted" in _plain(result.output)
+
+    boom = TypeError("plain bench failure")
+    monkeypatch.setattr(infer, "_generate", MagicMock(side_effect=[("warm", 1), boom]))
+    result = CliRunner().invoke(app, _bench_args(model_dir))
+    assert result.exception is boom
