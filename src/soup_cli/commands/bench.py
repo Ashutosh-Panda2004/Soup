@@ -240,7 +240,9 @@ def bench(
         try:
             cuda_graph_generation_kwargs(model_obj)
         except RuntimeError as exc:
-            console.print(f"[red]{exc}[/]")
+            from soup_cli.utils.terminal import for_terminal
+
+            console.print(f"[red]{for_terminal(str(exc))}[/]")
             raise typer.Exit(1) from exc
 
     load_time = time.time() - start_load
@@ -251,13 +253,18 @@ def bench(
     # Warmup run: first inference includes CUDA kernel JIT compilation,
     # which would skew the average. Discarded from timing.
     console.print("[dim]Warmup run (discarded from timing)...[/]")
-    warmup_messages = [{"role": "user", "content": test_prompts[0]}]
-    _generate(
-        model_obj, tokenizer, warmup_messages,
-        max_tokens=max_tokens if cuda_graphs is True else min(max_tokens, 32),
-        temperature=0.0,
-        **({"cuda_graphs": True} if cuda_graphs is True else {}),
-    )
+    if cuda_graphs is True:
+        from soup_cli.commands.infer import _warm_cuda_graphs
+
+        # Capture on the longest prompt at the timed length, so no timed request
+        # changes the static cache's shape and recompiles inside the measurement.
+        _warm_cuda_graphs(model_obj, tokenizer, list(dict.fromkeys(test_prompts)), max_tokens)
+    else:
+        warmup_messages = [{"role": "user", "content": test_prompts[0]}]
+        _generate(
+            model_obj, tokenizer, warmup_messages,
+            max_tokens=min(max_tokens, 32), temperature=0.0,
+        )
 
     total_tokens = 0
     total_latency = 0.0
@@ -269,11 +276,18 @@ def bench(
         messages = [{"role": "user", "content": prompt_text}]
         start_time = time.time()
 
-        _, token_count = _generate(
-            model_obj, tokenizer, messages,
-            max_tokens=max_tokens, temperature=0.0,
-            **({"cuda_graphs": True} if cuda_graphs is True else {}),
-        )
+        try:
+            _, token_count = _generate(
+                model_obj, tokenizer, messages,
+                max_tokens=max_tokens, temperature=0.0,
+                **({"cuda_graphs": True} if cuda_graphs is True else {}),
+            )
+        except RuntimeError as exc:
+            if cuda_graphs is not True:
+                raise
+            from soup_cli.commands.infer import _cuda_graph_failure
+
+            raise _cuda_graph_failure(exc) from exc
 
         latency = time.time() - start_time
         total_tokens += token_count

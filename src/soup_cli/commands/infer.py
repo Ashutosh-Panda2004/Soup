@@ -251,7 +251,7 @@ def infer(
         try:
             cuda_graph_generation_kwargs(model_obj)
         except RuntimeError as exc:
-            console.print(f"[red]{exc}[/]")
+            console.print(f"[red]{for_terminal(str(exc))}[/]")
             raise typer.Exit(1) from exc
     console.print("[green]Model loaded.[/]\n")
 
@@ -264,6 +264,9 @@ def infer(
             "[red]--output must stay under the current working directory.[/]"
         )
         raise typer.Exit(1)
+
+    if cuda_graphs is True:
+        _warm_cuda_graphs(model_obj, tokenizer, prompts, max_tokens)
 
     # Run inference — stream results to disk as they are generated
     output_path = Path(output_file)
@@ -286,11 +289,16 @@ def infer(
 
         for prompt_text in prompts:
             messages = [{"role": "user", "content": prompt_text}]
-            response, token_count = _generate(
-                model_obj, tokenizer, messages,
-                max_tokens=max_tokens, temperature=temperature,
-                **({"cuda_graphs": True} if cuda_graphs is True else {}),
-            )
+            try:
+                response, token_count = _generate(
+                    model_obj, tokenizer, messages,
+                    max_tokens=max_tokens, temperature=temperature,
+                    **({"cuda_graphs": True} if cuda_graphs is True else {}),
+                )
+            except RuntimeError as exc:
+                if cuda_graphs is not True:
+                    raise
+                raise _cuda_graph_failure(exc) from exc
 
             result = {
                 "prompt": prompt_text,
@@ -759,3 +767,43 @@ def _generate(
     token_count = new_tokens.shape[0]
     response_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     return response_text, token_count
+
+
+def _count_prompt_tokens(tokenizer, prompt_text: str) -> int:
+    """Tokens in the chat-templated prompt: the length the static cache must hold."""
+    from soup_cli.utils.vllm import encode_chat_prompt
+
+    inputs = encode_chat_prompt(
+        [{"role": "user", "content": prompt_text}], tokenizer,
+        fallback_on_error=False, return_tensors="pt",
+    )
+    return int(inputs["input_ids"].shape[1])
+
+
+def _longest_prompt(tokenizer, prompts: list[str]) -> str:
+    return max(prompts, key=lambda text: _count_prompt_tokens(tokenizer, text))
+
+
+def _cuda_graph_failure(exc: BaseException) -> typer.Exit:
+    console.print(
+        f"[red]Generation failed with --cuda-graphs: {for_terminal(str(exc))}. "
+        "Omit --cuda-graphs to use normal generation.[/]"
+    )
+    return typer.Exit(1)
+
+
+def _warm_cuda_graphs(model, tokenizer, prompts: list[str], max_tokens: int) -> None:
+    """Capture once, on the longest prompt, before any output is written.
+
+    Transformers sizes a static cache as max(this request, every earlier one), so
+    warming on the longest prompt means no later request changes the cache shape and
+    recompiles. Greedy, so it consumes none of the sampling RNG the real rows use.
+    """
+    console.print("[dim]Compiling CUDA graph decode (one-time; the first request is slower)...[/]")
+    messages = [{"role": "user", "content": _longest_prompt(tokenizer, prompts)}]
+    try:
+        _generate(
+            model, tokenizer, messages, max_tokens=max_tokens, temperature=0.0, cuda_graphs=True,
+        )
+    except RuntimeError as exc:
+        raise _cuda_graph_failure(exc) from exc
