@@ -39,13 +39,51 @@ def _has_offload_hook(hook: Any) -> bool:
     )
 
 
+_PEFT_REFUSAL = "CUDA graph decoding supports a single LoRA adapter over a stock model"
+
+
+def _unwrap_peft(model: Any) -> Any:
+    """Return the transformers model under a PEFT wrapper; refuse what graphs cannot hold.
+
+    The adapter stays UNMERGED: without --cuda-graphs Soup runs it unmerged, and
+    merging would change outputs by rounding, breaking this option's contract of
+    identical tokens.
+    """
+    if not type(model).__module__.startswith("peft."):
+        return model
+    get_base_model = getattr(model, "get_base_model", None)
+    configs = getattr(model, "peft_config", None)
+    if not callable(get_base_model) or not isinstance(configs, dict):
+        raise RuntimeError(_PEFT_REFUSAL)
+    active = getattr(model, "active_adapters", None)
+    if isinstance(active, str):
+        active = [active]
+    if not isinstance(active, (list, tuple)) or len(active) != 1 or active[0] not in configs:
+        raise RuntimeError("CUDA graph decoding supports exactly one active LoRA adapter")
+    adapter = configs[active[0]]
+    peft_type = getattr(adapter, "peft_type", None)
+    peft_type = getattr(peft_type, "value", peft_type)
+    if peft_type != "LORA":
+        raise RuntimeError(f"CUDA graph decoding supports LoRA adapters only, not {peft_type}")
+    if getattr(adapter, "use_dora", False):
+        raise RuntimeError("CUDA graph decoding does not support DoRA adapters")
+    base = get_base_model()
+    if any(getattr(module, "merged", False) is True for module in base.modules()):
+        raise RuntimeError(
+            "CUDA graph decoding requires an unmerged adapter; merged weights would not "
+            "match normal generation"
+        )
+    return base
+
+
 def _validate_model(model: Any) -> None:
     if getattr(model, "training", True):
         raise RuntimeError("CUDA graph decoding requires model.eval()")
+    base = _unwrap_peft(model)
     config = getattr(model, "config", None)
     model_type = getattr(config, "model_type", None)
     expected = _STOCK_MODELS.get(model_type)
-    if expected != (type(model).__module__, type(model).__name__):
+    if expected != (type(base).__module__, type(base).__name__):
         raise RuntimeError("CUDA graph decoding supports stock Qwen2 and Llama causal models")
     if getattr(config, "is_encoder_decoder", False):
         raise RuntimeError("CUDA graph decoding requires a decoder-only model")
