@@ -45,12 +45,12 @@ last non-empty line, and its number is the last number anywhere in it, which is 
 
 Both sides are normalised the same way: surrounding whitespace; every ``$``, ``\\$``, ``\\(``,
 ``\\)``, ``\\[`` and ``\\]``; ``\\left`` / ``\\right``; ``\\dfrac`` / ``\\tfrac`` read as
-``\\frac``; LaTeX spacing (``\\,``, ``\\!``, ``\\;``, ``\\:``, ``\\ ``) and ``{,}`` thousands
-separators; markdown ``*`` at either end; trailing ``. , ; : !``; and the Unicode minus sign. A
-number is then exactly one literal: an optional sign, digits with optional ``,`` groups of three,
-an optional fraction and an optional exponent (``-1,000.5``, ``.5``, ``1e5``). Anything else,
-such as ``42 apples``, ``\\frac{14}{3}`` or ``p - q``, is compared as text, ignoring case and
-whitespace.
+``\\frac``; LaTeX spacing (``\\,``, ``\\!``, ``\\;``, ``\\:``, ``\\ ``, but never the second
+backslash of a ``\\\\`` line break) and ``{,}`` thousands separators; markdown ``*`` at either
+end; trailing ``. , ; : !``; and the Unicode minus sign. A number is then exactly one literal: an
+optional sign, digits with optional ``,`` groups of three, an optional fraction and an optional
+exponent (``-1,000.5``, ``.5``, ``1e5``). Anything else, such as ``42 apples``,
+``\\frac{14}{3}`` or ``p - q``, is compared as text, ignoring case and whitespace.
 
 Every scan is linear in its input, because a completion is untrusted model output.
 """
@@ -87,7 +87,9 @@ _ANSWER_LABEL_RE = re.compile(r"[*_\s]*(?:final\s+)?answer[*_\s]*(?::[*_\s]*)?",
 _NON_SPACE_RE = re.compile(r"\S")
 # The characters that can end a phrase's clause, or open or close a bracket inside it.
 _CLAUSE_CHAR_RE = re.compile(r"[()\[\]{}.,;]")
-_LATEX_SPACING_RE = re.compile(r"\\[,!;: ]")
+# A LaTeX line break '\\' is consumed whole, so its second backslash is never read as the
+# control space '\ ' ('\\ -14' must stay '\\ -14', not become '\-14').
+_LATEX_SPACING_RE = re.compile(r"\\\\|\\[,!;: ]")
 _MATH_DELIMITER_RE = re.compile(r"\\[()\[\]]")
 # Not followed by a letter, so ``\leftarrow`` and ``\rightarrow`` stay whole.
 _SIZING_RE = re.compile(r"\\(?:left|right)(?![A-Za-z])")
@@ -130,7 +132,7 @@ class FinalAnswer:
 def _canonical_symbols(text: str) -> str:
     """Rewrite spellings that change no value: the Unicode minus, LaTeX thousands separators."""
     text = text.replace("\u2212", "-").replace("{,}", ",")
-    return _LATEX_SPACING_RE.sub("", text)
+    return _LATEX_SPACING_RE.sub(lambda match: "\\\\" if match.group() == "\\\\" else "", text)
 
 
 def normalize_answer(text: str) -> str:
