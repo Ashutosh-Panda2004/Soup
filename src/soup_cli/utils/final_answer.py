@@ -28,15 +28,16 @@ reference states no answer.
 
 The two delimited forms are authoritative: what they enclose IS the answer, number or not, so a
 list or a tuple there is one answer. A phrase has no closing delimiter, so its values are read
-from its clause: the stand-alone numbers outside brackets (the digits of ``(3, 4)``,
-``\\frac{14}{3}``, ``2^{10}`` or ``2x``, and of a time or a ratio such as ``3:45`` or
-``1:1,000``, belong to one expression, not to several values) and every stand-alone number in
-its aside. A clause with MORE THAN ONE distinct value is a hedge
-(``The answer is either 41 or 42.``): it states no answer, so a completion that hedges scores
-0.0 and a gold that hedges is refused. Every number in the clause counts, a justification's
-too (``42 because 6*7=42`` is a hedge), and a comma or a period before a justification ends the
-clause (``42, because 6*7=42`` is 42). One value, even repeated (``42 or 42.0``), is the
-clause's number; a clause with no digits at all falls back to a completion's last number.
+from its clause: the stand-alone numbers outside brackets and LaTeX environments (the digits of
+``(3, 4)``, of a ``\\begin{pmatrix} 3 \\\\ 4 \\end{pmatrix}`` matrix, of ``\\frac{14}{3}``,
+``2^{10}`` or ``2x``, and of a time or a ratio such as ``3:45`` or ``1:1,000``, belong to one
+expression, not to several values) and every stand-alone number in its aside. A clause with
+MORE THAN ONE distinct value is a hedge (``The answer is either 41 or 42.``): it states no
+answer, so a completion that hedges scores 0.0 and a gold that hedges is refused. Every number
+in the clause counts, a justification's too (``42 because 6*7=42`` is a hedge), and a comma or
+a period before a justification ends the clause (``42, because 6*7=42`` is 42). One value, even
+repeated (``42 or 42.0``), is the clause's number; a clause with no digits at all falls back to
+a completion's last number.
 
 A text that states no explicit answer is free text. A reference is then its whole value, which
 must fit on one line (a bare answer such as ``"42"`` or ``"Paris"``). A completion reads as its
@@ -99,11 +100,12 @@ _NUMBER_PATTERN = r"[-+]?" + _UNSIGNED_PATTERN + r"(?:[eE][-+]?\d+)?"
 _NUMBER_RE = re.compile(_NUMBER_PATTERN)
 # Not glued to a word ("2x", "3rd") or to a LaTeX expression ("\frac{14}{3}", "2^{10}", "4/5").
 _STANDS_ALONE = r"(?<![\w\\{}^/.])"
-# A bracket, which lets a scan track depth; a time or a ratio ("3:45", "1:1,000"), which is ONE
-# answer and is matched whole so that none of its numbers reads as a value; or, as group 1, a
-# number that stands alone.
+# A bracket, or a LaTeX environment's "\begin{...}" / "\end{...}", which lets a scan track depth
+# (a matrix is one answer, not one value per entry); a time or a ratio ("3:45", "1:1,000"), which
+# is ONE answer and is matched whole so that none of its numbers reads as a value; or, as group
+# 1, a number that stands alone.
 _VALUE_TOKEN_RE = re.compile(
-    r"[()\[\]{}]"
+    r"\\(?:begin|end)\{[A-Za-z*]*\}|[()\[\]{}]"
     + "|" + _STANDS_ALONE + "[-+]?" + _UNSIGNED_PATTERN + "(?::" + _UNSIGNED_PATTERN + ")+"
     + "|" + _STANDS_ALONE + r"(?<!\d:)(" + _NUMBER_PATTERN + r")(?![\w{}^/]|:\d)"
 )
@@ -195,8 +197,8 @@ def _split_clause(line: str) -> tuple[str, str]:
 
 
 def _clause_values(answer: str, aside: str) -> frozenset[Decimal]:
-    """The distinct values a clause names: the answer's stand-alone numbers outside brackets,
-    and every stand-alone number in its aside. Both texts are normalised."""
+    """The distinct values a clause names: the answer's stand-alone numbers outside brackets and
+    LaTeX environments, and every stand-alone number in its aside. Both texts are normalised."""
     values: set[Decimal | None] = set()
     depth = 0
     for match in _VALUE_TOKEN_RE.finditer(answer):
@@ -204,9 +206,9 @@ def _clause_values(answer: str, aside: str) -> frozenset[Decimal]:
         if match.group(1) is not None:
             if depth == 0:
                 values.add(_to_decimal(match.group(1)))
-        elif token in _OPENERS:
+        elif token in _OPENERS or token.startswith("\\begin"):
             depth += 1
-        elif token in _CLOSERS:
+        elif token in _CLOSERS or token.startswith("\\end"):
             depth = max(0, depth - 1)
         # Any other token is a time or a ratio: one answer, not a value.
     values.update(_to_decimal(m.group(1)) for m in _VALUE_TOKEN_RE.finditer(aside) if m.group(1))

@@ -1241,17 +1241,19 @@ a hedge and states no answer: `The answer is either 41 or 42.`, `Answer: 41 or 4
 gold written that way is refused. Every number in the clause counts, a justification's too:
 `The answer is 42 because 6*7=42.` is a hedge, while `The answer is 42, because 6*7=42.` reads 42.
 The same value twice is not a hedge (`42 (i.e. 42.0)`), and the digits of one bracketed or LaTeX
-answer (`(3, 4)`, `\frac{14}{3}`, `2^{10}`) or of a time or a ratio (`3:45`, `1:1,000`) are not
-separate values; such an answer is compared as text. `\boxed{}` and `####` answers are compared
-whole, so a list there is one answer, and it can only match a gold that is the same list.
+answer (`(3, 4)`, `\begin{pmatrix} 3 \\ 4 \end{pmatrix}`, `\frac{14}{3}`, `2^{10}`) or of a time
+or a ratio (`3:45`, `1:1,000`) are not separate values; such an answer is compared as text.
+`\boxed{}` and `####` answers are compared whole, so a list there is one answer, and it can only
+match a gold that is the same list.
 
 A numeric gold is compared by value, so `#### 1,000`, `\boxed{1000}` and `The answer is $1000.`
 all match a gold of `1000`. Any other gold (`\frac{14}{3}`, `p - q`, `Paris`) is compared as text,
 ignoring case and whitespace, `$`, `\(...\)` and `\[...\]`, `\left` / `\right`, and `\dfrac` /
 `\tfrac` versus `\frac`; so `\boxed{\dfrac{14}{3}}` matches a gold of `\frac{14}{3}`. Both sides
-also drop the trailing punctuation `. , ; : !`, LaTeX thousands separators such as `1{,}000`, and a
-Unicode minus sign. Units, `^\circ`, `\text{}` and `x = ` prefixes are not stripped, and nothing is
-evaluated (`\frac{1}{2}` does not equal `0.5`).
+also drop the trailing punctuation `. , ; : !`, LaTeX thousands separators such as `1{,}000`, the
+LaTeX spacing commands `\,` `\!` `\;` `\:` and `\ `, and a Unicode minus sign. A `\\` row break is
+kept whole, so a matrix matches however its rows are spaced. Units, `^\circ`, `\text{}` and
+`x = ` prefixes are not stripped, and nothing is evaluated (`\frac{1}{2}` does not equal `0.5`).
 
 For GRPO, Soup preserves source dataset columns and TRL passes them to reward functions as
 keyword arguments. An Alpaca `output` or the final assistant turn in ShareGPT/ChatML is also

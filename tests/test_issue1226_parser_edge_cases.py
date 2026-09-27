@@ -15,7 +15,9 @@ r"""Edge cases of the #1226 final-answer parser, found while reviewing the fix.
 5. **A LaTeX line break keeps both backslashes.** ``\\ -14`` is a row break followed by a space,
    not the control space ``\ ``, so it must not normalise to ``\-14``. Every MATH-500 gold with a
    space after a row break is a matrix (7 of 500), and each one matched only a completion that
-   spaced its rows identically. The spacing commands themselves are still dropped.
+   spaced its rows identically. The spacing commands themselves are still dropped. After an
+   answer phrase a matrix is one answer: a LaTeX environment is a bracket to the value scan, so
+   entries that stand apart are not a hedge between several values.
 
 The linear-time check of the clause scanner is in ``test_issue1226_clause_scanner_is_linear.py``.
 """
@@ -285,6 +287,21 @@ class TestALatexLineBreakKeepsBothBackslashes:
         column = r"\begin{pmatrix} 1 \\ 2 \end{pmatrix}"
         assert _scores(r"\boxed{\begin{pmatrix}1\\2\end{pmatrix}}", column) == (1.0, 1.0)
         assert _scores(r"\boxed{\begin{pmatrix}12\end{pmatrix}}", column) == (0.0, 0.0)
+
+    @pytest.mark.parametrize(("gold", "spelling"), MATRIX_SPELLINGS)
+    def test_a_matrix_after_an_answer_phrase_is_one_answer(self, gold, spelling):
+        # A matrix's entries are one answer, not several values: no hedge, whatever the spacing.
+        assert _scores("The answer is $" + spelling + "$.", gold) == (1.0, 1.0)
+        assert _scores("Answer: $" + spelling + "$", gold) == (1.0, 1.0)
+
+    def test_a_phrased_matrix_is_one_text_answer_not_a_number(self):
+        column = r"\begin{pmatrix} 3 \\ 4 \end{pmatrix}"
+        phrased = "The answer is $" + column + "$."
+        assert _scores(phrased, column) == (1.0, 1.0)
+        assert _scores(phrased, "3") == (0.0, 0.0)  # not its first entry
+        assert parse_reference(phrased) is not None  # a gold written that way is readable
+        # The environment closes: a value on each side of the matrix is still a hedge.
+        assert _scores("The answer is 5 or $" + column + "$ or 6.", "5") == (0.0, 0.0)
 
     @pytest.mark.parametrize("command", [r"\,", r"\!", r"\;", r"\:", "\\ "])
     def test_the_spacing_commands_are_still_dropped(self, command):
