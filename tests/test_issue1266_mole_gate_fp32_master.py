@@ -12,10 +12,10 @@ moments were bf16 as well:
   draws from U(-1/sqrt(hidden), 1/sqrt(hidden)). After 8 steps 91.4% of the gate
   was bit-identical at hidden 64 and 82.6% at hidden 576;
 * ``"cuda:0"`` kept the gate fp32, because the check was ``== "cuda"``;
-* under the pre-Ampere flags open PR #868 adds (``fp16=True``) the fp16
-  GradScaler would receive a bf16 gradient, which its CUDA unscale kernel
-  rejects (#425), and ``align_trainable_dtype_for_fp16`` casts only ``lora_``
-  parameters, so it never reached the gate.
+* under the pre-Ampere flags (``fp16=True``, which ``bf16_fp16_flags`` gives a
+  T4/V100/P100) the fp16 GradScaler would receive a bf16 gradient, which its CUDA
+  unscale kernel rejects (#425), and ``align_trainable_dtype_for_fp16`` casts only
+  ``lora_`` parameters, so it never reached the gate.
 
 The dtype decision reads the device string, so ``MoleRoutingTrainerWrapper(cfg,
 device="cuda")`` on a CPU-only box builds what a GPU run builds. The one call of
@@ -23,6 +23,13 @@ that branch that needs a card on ``main`` is the gate's placement; the fixture
 below rewrites the DEVICE of a CUDA ``nn.Module.to`` call to ``"cpu"`` and keeps
 its dtype, so the unfixed code fails an assertion here rather than failing to
 find a GPU. Training runs through ``use_cpu=True``. Nothing here touches a GPU.
+
+The training steps run their half-precision matmuls on ATen's kernels
+(``aten_half_matmuls`` in conftest.py). On the ``"cuda"`` branch the frozen base
+itself is bf16, so even a step without autocast multiplies bf16 matrices, and on
+part of GitHub's ``windows-latest`` fleet the first one oneDNN runs dies with
+``0xc000001d``. The dtypes and counts pinned here do not depend on which library
+multiplies the matrices.
 """
 
 from __future__ import annotations
@@ -206,17 +213,29 @@ def _unchanged_fraction(before, after):
     return same / before.numel(), same, before.numel()
 
 
+def _matmuls_on_aten() -> bool:
+    """Whether ``aten_half_matmuls`` is in effect: oneDNN off, fused SDPA off.
+
+    ``flash_sdp_enabled`` lives under ``torch.backends.cuda``, but it reads the one
+    process-wide switch the CPU SDPA dispatcher checks too.
+    """
+    import torch
+
+    return not torch.backends.mkldnn.enabled and not torch.backends.cuda.flash_sdp_enabled()
+
+
 @pytest.fixture
-def cpu_run(monkeypatch):
+def cpu_run(monkeypatch, aten_half_matmuls):
     """Keep every run on the CPU, and hand ``train()`` the precision flags a card gets.
 
-    ``train()`` on ``main`` passes neither ``bf16`` nor ``fp16``; open PR #868 adds them
-    from ``bf16_fp16_flags``. ``cpu_run(bf16=True)`` is what an Ampere+ card will get,
-    ``cpu_run(fp16=True)`` a pre-Ampere one; by default both are off, as today.
+    The flags set here override whatever ``train()`` asks for, so these tests do not
+    depend on it: ``cpu_run(bf16=True)`` is what ``bf16_fp16_flags`` gives an Ampere+
+    card, ``cpu_run(fp16=True)`` a pre-Ampere one, and by default both are off.
     ``use_cpu=True`` also keeps a dev box that has a card from training on it, and
     the tests assert ``args.use_cpu`` so a patch that did not take cannot pass
     silently. A factory rather than a subclass, so the arguments object stays a
-    real ``TrainingArguments``.
+    real ``TrainingArguments``. The steps' matmuls run on ATen's kernels
+    (``aten_half_matmuls``), which the tests assert for the same reason.
     """
     import sys
 
@@ -314,6 +333,34 @@ class TestTheGateIsAnFp32MasterWeight:
 
         assert _gate_weight(wrapper).dtype == torch.float32
 
+    # peft loads each adapter tensor into the meta base's LoRA layers, a no-op torch
+    # reports once per tensor.
+    @pytest.mark.filterwarnings("ignore:for .*copying from a non-meta parameter:UserWarning")
+    def test_the_gate_is_created_on_the_base_models_device(
+        self, mole_inputs, tmp_path, monkeypatch
+    ):
+        """A base the Trainer never moves needs the gate beside it already. A
+        pre-quantized bitsandbytes checkpoint is placed on its GPU at load, and neither
+        the Trainer (``_move_model_to_device``) nor Accelerate moves a 4/8-bit model, so
+        a gate left on the CPU would meet a CUDA base in ``compute_loss``. The ``meta``
+        device stands in for that GPU; the checkpoints are built before the loader is
+        patched."""
+        import torch
+        import transformers
+
+        base, adapters = mole_inputs("h64")
+        real_load = transformers.AutoModelForCausalLM.from_pretrained
+
+        def load_on_meta(*args, **kwargs):
+            return real_load(*args, **kwargs).to("meta")
+
+        monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", load_on_meta)
+        wrapper = _setup(base, adapters, tmp_path, device="cuda")
+
+        weight = _gate_weight(wrapper)
+        assert weight.device.type == "meta", weight.device
+        assert weight.dtype == torch.float32
+
     @pytest.mark.parametrize(
         "device, base_dtype", [("cuda", "bfloat16"), ("cpu", "float32")], ids=["cuda", "cpu"]
     )
@@ -353,6 +400,7 @@ class TestEightStepsAtTheDefaultLr:
 
         trainer = wrapper.trainer
         assert trainer.args.use_cpu
+        assert _matmuls_on_aten(), "the bf16 steps ran on oneDNN or fused SDPA"
         assert trainer.state.global_step == 8
         assert trainer.args.learning_rate == pytest.approx(_DEFAULT_LR if lr is None else lr)
         after = _gate_weight(wrapper)
@@ -378,6 +426,7 @@ class TestEightStepsAtTheDefaultLr:
         wrapper.train()
 
         assert wrapper.trainer.args.use_cpu
+        assert _matmuls_on_aten(), "the bf16 steps ran on oneDNN or fused SDPA"
         assert optimizer_probe["trainable"] == {"mole_gate.gate.weight": torch.float32}
         assert optimizer_probe["grad"] == [torch.float32] * 8, optimizer_probe["grad"]
         moments = optimizer_probe["moments"]
@@ -407,8 +456,8 @@ class TestEightStepsAtTheDefaultLr:
 
 class TestUnderTheFlagsACardGets:
     """``(bf16=True, fp16=False)`` on Ampere+ and ``(bf16=False, fp16=True)`` on a
-    T4/V100/P100, the flags open PR #868 passes. Injected here, since ``train()`` on
-    ``main`` passes neither."""
+    T4/V100/P100, as ``bf16_fp16_flags`` resolves them. Injected through ``cpu_run``,
+    so these hold whether or not ``train()`` passes the flags itself."""
 
     @pytest.mark.parametrize(
         "bf16, fp16", [(True, False), (False, True)], ids=["ampere-bf16", "pre-ampere-fp16"]
@@ -427,6 +476,7 @@ class TestUnderTheFlagsACardGets:
 
         args = wrapper.trainer.args
         assert args.use_cpu
+        assert _matmuls_on_aten(), "the half-precision steps ran on oneDNN or fused SDPA"
         assert (args.bf16, args.fp16) == (bf16, fp16)
         assert optimizer_probe["trainable"] == {"mole_gate.gate.weight": torch.float32}, (
             optimizer_probe["trainable"]
@@ -446,18 +496,22 @@ class TestUnderTheFlagsACardGets:
 
         trainer = wrapper.trainer
         assert trainer.args.use_cpu
+        assert _matmuls_on_aten(), "the bf16 steps ran on oneDNN or fused SDPA"
         assert trainer.args.bf16 and trainer.accelerator.native_amp, "autocast was not on"
         assert trainer.state.global_step == 8
         fraction, same, total = _unchanged_fraction(before, _gate_weight(wrapper))
         assert fraction <= 0.01, f"{same}/{total} gate elements bit-identical"
         assert _gate_weight(wrapper).dtype == torch.float32
 
-    def test_an_fp16_autocast_grad_scaler_step_trains_the_gate(self, mole_inputs, tmp_path):
+    def test_an_fp16_autocast_grad_scaler_step_trains_the_gate(
+        self, mole_inputs, tmp_path, aten_half_matmuls
+    ):
         """An optimizer step the way Accelerate runs fp16 on a CUDA card: autocast only
         ``model.forward``, convert its outputs to fp32, and scale the loss. CPU autocast
         and the CPU GradScaler stand in for the CUDA ones; CUDA's unscale kernel has no
         bf16 implementation (#425) and the CPU one does, so the gradient dtype it would
-        reject is asserted directly."""
+        reject is asserted directly. The matmuls run on ATen's kernels
+        (``aten_half_matmuls``); this test does not go through ``cpu_run``."""
         import torch
         from accelerate.utils import convert_outputs_to_fp32
         from transformers import Trainer
@@ -495,6 +549,7 @@ class TestUnderTheFlagsACardGets:
                 taken_at = attempt
                 break
         assert taken_at is not None, "the GradScaler skipped every step"
+        assert _matmuls_on_aten(), "the fp16 step ran on oneDNN or fused SDPA"
         fraction, same, total = _unchanged_fraction(before, weight)
         assert fraction <= 0.01, f"{same}/{total} gate elements bit-identical after one step"
 
@@ -594,6 +649,7 @@ class TestTheSavedGate:
         monkeypatch.chdir(tmp_path)
         wrapper = _setup(*mole_inputs("h64"), tmp_path / "run", device="cuda")
         result = wrapper.train()
+        assert _matmuls_on_aten(), "the bf16 steps ran on oneDNN or fused SDPA"
         trained = _gate_weight(wrapper).detach()
 
         saved = torch.load(result["gate_path"], map_location="cpu", weights_only=True)
@@ -626,6 +682,7 @@ class TestTheSavedGate:
 
         result = wrapper.train()
 
+        assert _matmuls_on_aten(), "the bf16 steps ran on oneDNN or fused SDPA"
         held = _gate_weight(wrapper).detach()
         assert held.dtype == torch.bfloat16, "the stand-in cast did not take"
         saved = torch.load(result["gate_path"], map_location="cpu", weights_only=True)

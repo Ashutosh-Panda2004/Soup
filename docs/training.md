@@ -1770,11 +1770,13 @@ training:
 The gate is the only trainable parameter; it is saved as `mole_gate.pt` alongside the run.
 It trains as an fp32 master weight on every device, so its gradient and AdamW moments are
 fp32 too, even where the frozen base loads in bf16 (on CUDA), and `mole_gate.pt` is saved in
-fp32 (a `Linear(hidden, N)`, a few kilobytes). A bf16 gate with no fp32 copy would round most
-AdamW steps away at the default `lr` (#1266).
+fp32: a `Linear(hidden, N)` of `4 x hidden x N` bytes, about 7 KB for the example above and
+2 MiB at hidden 8192 with 64 adapters. A bf16 gate with no fp32 copy would round most AdamW
+steps away at the default `lr` (#1266).
 `compute_loss` runs N+1 forwards per step (base + each adapter under `torch.no_grad()`, blended
-by the per-token gate weights) so step time scales with the number of task adapters. Training
-only — there is no serve-time MoLE path yet. (v0.71.12)
+by the per-token gate weights) so step time scales with the number of task adapters. To serve
+the trained router, see `soup serve --mole` in [Serving and Export](serving-and-export.md).
+(v0.71.12)
 
 
 ## Architecture Knobs — Mixture-of-Depths, LLaMA Pro, LongLoRA

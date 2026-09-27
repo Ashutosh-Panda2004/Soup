@@ -307,9 +307,12 @@ class MoleRoutingTrainerWrapper:
         # gradient and AdamW moments are fp32 with it. Cast to bf16 on "cuda" (no
         # autocast, no fp32 copy), an AdamW step of about lr rounded away for most
         # of its initial weights. The frozen base may still load in bf16:
-        # compute_loss casts between the two. The Trainer moves the gate to the
-        # device with the rest of the model.
-        gate = build_gating_kernel(gate_cfg).to(dtype=torch.float32)
+        # compute_loss casts between the two. The gate is created where the base
+        # is. A base loaded to the CPU is moved by the Trainer, gate and all; a base
+        # the Trainer never moves (a pre-quantized bitsandbytes checkpoint, placed
+        # on its GPU at load) already has the gate beside it.
+        base_device = next(base_model.parameters()).device
+        gate = build_gating_kernel(gate_cfg).to(device=base_device, dtype=torch.float32)
         gate.requires_grad_(True)
         # nn.Module.__setattr__ registers the gate as a submodule, so its
         # params appear in model.parameters() for the optimizer; the plain
