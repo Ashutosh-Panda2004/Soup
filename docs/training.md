@@ -91,7 +91,12 @@ they do not evaluate by default, and they do not withhold rows either:
 `data.val_split` is ignored, every row trains, and the run prints a one-line note
 saying so. On `grpo`, set `training.eval_steps` to hold the split out and
 evaluate it; TRL generates completions for the held-out prompts and logs
-`eval_loss` with the evaluation rewards. TRL needs whole groups of
+`eval_loss` with the evaluation rewards. On `grpo` that `eval_loss` (the Val
+loss row and the tracker's `val_loss`) is TRL's policy objective on the
+held-out completions, not a likelihood: advantages are normalised within each
+group, so it stays near zero, can be negative, and does not measure held-out
+quality. The held-out reward is `eval_reward`, in the `log_history` of each
+checkpoint's `trainer_state.json`. TRL needs whole groups of
 `num_generations` completions in an evaluation batch, so `grpo` evaluates at the
 largest multiple of `num_generations` that fits in the train batch, and says so
 when that differs from the train batch. The evaluation's rewards never reach the
@@ -104,7 +109,8 @@ those two is a separate feature.
 **Refused at config load.** `training.eval_steps` on `backend: mlx` (mlx-lm
 evaluates the split on its own cadence, #739), on `task: unlearn` (it trains on
 `forget_set` / `retain_set` and has no validation split), and with
-`val_split: 0` on local files, where there would be nothing to evaluate.
+`val_split: 0` on local files or remote URIs, where there would be nothing to
+evaluate.
 
 **Evaluated but not tracked: `prm` and `moe_lora_routing`.** They attach no live
 training callback (#802), so their `eval_loss` reaches the trainer's log history

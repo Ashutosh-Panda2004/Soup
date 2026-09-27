@@ -121,6 +121,21 @@ class TestEvalStepsFootguns:
                 )
             )
 
+    @pytest.mark.parametrize(
+        "train", ["https://example.com/train.jsonl", "s3://bucket/train.jsonl"]
+    )
+    def test_nothing_to_evaluate_on_a_remote_uri_with_val_split_zero(self, train):
+        """A remote URI is a file, not a hub dataset: it brings no validation
+        split of its own, so it is refused like a local file."""
+        with pytest.raises(ValueError, match="data.val_split is 0"):
+            _load(
+                _yaml(
+                    train=train,
+                    data_extra="  val_split: 0\n",
+                    training_extra="  eval_steps: 5\n",
+                )
+            )
+
     def test_a_hub_dataset_may_carry_its_own_validation_split(self):
         """The control. An HF-hub dataset's own ``validation`` split reaches the
         trainer whatever ``val_split`` says, so refusing here would refuse a
@@ -390,7 +405,9 @@ class TestTheNotice:
         )
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
-        assert out.stdout.strip() == "['grpo', 'online_dpo', 'ppo']"
+        # A plain print, but routed through the ANSI-strip helper all the same:
+        # the #1068 suite guard reads any `.stdout` assertion as CLI output.
+        assert _plain(out.stdout) == "['grpo', 'online_dpo', 'ppo']"
 
 
 # ==========================================================================

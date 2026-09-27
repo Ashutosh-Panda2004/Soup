@@ -318,6 +318,25 @@ def _build(tmp_path, monkeypatch, task, *, n_train=_TRAIN_ROWS, n_val=_VAL_ROWS,
     return wrapper
 
 
+def _trainer_default_device_is_cpu() -> bool:
+    """True when transformers' default device is the CPU these wrappers use.
+
+    Every wrapper here is built with ``device="cpu"``, but transformers moves
+    the model to its own default device: CUDA when a card is visible, MPS on
+    Apple Silicon. A resident model moves whole and does not notice. A streamed
+    model keeps its decoder weights where the wrapper streams them, so a
+    streamed forward then mixes devices ("found at least two devices, mps:0 and
+    cpu" on the macOS runners). ``test_v07200.py`` skips its CPU streaming steps
+    on MPS for the same reason.
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        return False
+    backend = getattr(torch.backends, "mps", None)
+    return not (backend is not None and backend.is_available())
+
+
 def _hf_trainer(wrapper):
     """`embedding` composes HF's Trainer instead of subclassing it."""
     trainer = wrapper.trainer
@@ -471,6 +490,11 @@ class TestLayerStreamingEvaluates:
 
     def test_a_streamed_run_evaluates_its_split(self, tmp_path, monkeypatch):
         _requires_train_extra()
+        if not _trainer_default_device_is_cpu():
+            pytest.skip(
+                "transformers places the model on cuda/mps here while the wrapper "
+                "streams on cpu (see _trainer_default_device_is_cpu)"
+            )
         monkeypatch.setenv("SOUP_LAYER_STREAM_CACHE_DIR", str(tmp_path / "cache"))
         (tmp_path / "streamed").mkdir()
         (tmp_path / "resident").mkdir()
@@ -495,6 +519,23 @@ class TestLayerStreamingEvaluates:
         streamed.trainer.train()
         evals = _eval_entries(streamed.trainer)
         assert len(evals) == 1 and math.isfinite(evals[0]["eval_loss"]), evals
+
+
+class TestTheStreamingSkipStaysNarrow:
+    """The streaming test above runs only where transformers' default device is
+    the CPU its wrapper streams on. Both edges are pinned: a condition that
+    quietly widened would skip the test everywhere, and a skipped test is the
+    same colour as a passing one."""
+
+    @pytest.mark.parametrize(
+        ("cuda", "mps", "runs"),
+        [(False, False, True), (False, True, False), (True, False, False), (True, True, False)],
+    )
+    def test_the_condition(self, monkeypatch, cuda, mps, runs):
+        torch = pytest.importorskip("torch")
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+        monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+        assert _trainer_default_device_is_cpu() is runs
 
 
 class TestNoSplitNoEvaluation:
