@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import conftest
 from tests.conftest import strip_ansi
 
 
@@ -328,10 +329,14 @@ def _trainer_default_device_is_cpu() -> bool:
     streamed forward then mixes devices ("found at least two devices, mps:0 and
     cpu" on the macOS runners). ``test_v07200.py`` skips its CPU streaming steps
     on MPS for the same reason.
+
+    CUDA is read through the suite's one probe, ``conftest.cuda_available``
+    (#833 forbids a private one), looked up at call time so the condition test
+    below can pin it.
     """
     import torch
 
-    if torch.cuda.is_available():
+    if conftest.cuda_available():
         return False
     backend = getattr(torch.backends, "mps", None)
     return not (backend is not None and backend.is_available())
@@ -533,7 +538,7 @@ class TestTheStreamingSkipStaysNarrow:
     )
     def test_the_condition(self, monkeypatch, cuda, mps, runs):
         torch = pytest.importorskip("torch")
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+        monkeypatch.setattr(conftest, "cuda_available", lambda: cuda)
         monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
         assert _trainer_default_device_is_cpu() is runs
 
