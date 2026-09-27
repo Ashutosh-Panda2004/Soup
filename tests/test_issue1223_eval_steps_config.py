@@ -431,8 +431,19 @@ def _write_chat_rows(directory: Path, n: int = _CHAT_ROWS) -> None:
 def _dry_run(tmp_path, monkeypatch, yaml_text: str) -> str:
     from typer.testing import CliRunner
 
+    import soup_cli.commands.train as train_cmd
     from soup_cli.cli import app
 
+    # The row counts pinned here do not depend on the machine, but a visible card
+    # does: on a dev box with a GPU the hardware-fit gate refuses before the dry
+    # run prints anything. Answer the two probes the way a CPU runner does (the
+    # #1212 tests stub them the same way): unknown VRAM skips the gate.
+    monkeypatch.setattr(train_cmd, "detect_device", lambda backend=None: ("cpu", "CPU"))
+    monkeypatch.setattr(
+        train_cmd,
+        "get_gpu_info",
+        lambda backend=None: {"memory_total": "0 MB", "memory_total_bytes": 0, "gpu_count": 0},
+    )
     monkeypatch.chdir(tmp_path)
     _write_chat_rows(tmp_path)
     (tmp_path / "soup.yaml").write_text(yaml_text, encoding="utf-8")
