@@ -886,10 +886,21 @@ def _rotary(model):
     return matches[0]
 
 
+def _inv_freq_on_cpu(model):
+    """The built model's rotary ``inv_freq``, on CPU for comparison.
+
+    ``setup()`` builds an HF Trainer, which moves the model to the accelerator
+    it finds even with ``device="cpu"`` (MPS on the macOS runners), while every
+    reference tensor here is computed on CPU. ``inv_freq`` is computed on CPU
+    when the model is built, so the copy back is exact.
+    """
+    return _rotary(model).inv_freq.detach().cpu()
+
+
 def _assert_built_with_the_composed_block(model) -> None:
     import torch
 
-    built = _rotary(model).inv_freq
+    built = _inv_freq_on_cpu(model)
     expected = _transformers_llama3_inv_freq(
         max_position_embeddings=TARGET, rope_parameters=COMPOSED_LLAMA31
     )
@@ -976,7 +987,7 @@ class TestTrainers:
 
         assert wrapper.model.config.max_position_embeddings == NATIVE_MAX
         assert wrapper.model.config.rope_parameters == NATIVE_LLAMA31
-        assert torch.equal(_rotary(wrapper.model).inv_freq, _native_inv_freq())
+        assert torch.equal(_inv_freq_on_cpu(wrapper.model), _native_inv_freq())
 
     @pytest.mark.parametrize("task", ["sft", "pretrain"])
     def test_a_longrope_checkpoint_fine_tunes_at_its_native_length(
@@ -1018,13 +1029,14 @@ class TestTrainers:
         assert math.isfinite(result["final_loss"]) and result["final_loss"] > 0, result
 
         native_config = AutoConfig.from_pretrained(longrope_checkpoint)
-        native_rotary = _rotary(AutoModelForCausalLM.from_pretrained(longrope_checkpoint))
+        native_model = AutoModelForCausalLM.from_pretrained(longrope_checkpoint)
+        native_rotary = _rotary(native_model)
         built_rotary = _rotary(wrapper.model)
 
         assert native_config.rope_parameters["rope_type"] == "longrope"
         assert wrapper.model.config.rope_parameters == native_config.rope_parameters
         assert wrapper.model.config.max_position_embeddings == NATIVE_MAX
-        assert torch.equal(built_rotary.inv_freq, native_rotary.inv_freq)
+        assert torch.equal(_inv_freq_on_cpu(wrapper.model), _inv_freq_on_cpu(native_model))
         assert built_rotary.attention_scaling == native_rotary.attention_scaling
 
     def test_sft_default_rope_checkpoint_extends_exactly_as_before(
