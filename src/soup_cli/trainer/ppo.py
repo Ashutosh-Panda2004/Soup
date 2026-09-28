@@ -777,9 +777,11 @@ class PPOTrainerWrapper:
         self.trainer.save_model(self._output_dir)
         self.tokenizer.save_pretrained(self._output_dir)
 
-        # Extract metrics
+        # Extract metrics. trl's PPO trainer (0.29) logs per-step losses under
+        # ``loss/policy_avg`` rather than ``loss``; the key is declared here
+        # instead of guessed (see #1413).
         logs = self.trainer.state.log_history
-        loss_summary = summarize_training_loss(logs)
+        loss_summary = summarize_training_loss(logs, loss_key="loss/policy_avg")
 
         hours = int(duration // 3600)
         minutes = int((duration % 3600) // 60)
