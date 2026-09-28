@@ -14,7 +14,7 @@ Scores three orthogonal axes after running a ``task='unlearn'`` job:
 Verdicts follow the project's OK / MINOR / MAJOR taxonomy (same
 thresholds as v0.26.0 Part D Quant-Lobotomy + v0.56.0 diagnose).
 
-Live-model evaluation hooks are deferred to v0.61.1 — this module ships
+Live-model evaluation hooks are not implemented — this module ships
 pure-Python kernels + a frozen ``UnlearnReport`` + bundled TOFU / MUSE /
 WMDP mini-fixtures (v0.71.1 #195 added the MUSE + WMDP loaders).
 Operators can supply pre-computed ``evidence`` JSON to drive the
@@ -450,7 +450,7 @@ def get_fixture_path(benchmark: str) -> Optional[Path]:
 
     TOFU ships in v0.61.0 (synthetic author profile mini-set under
     ``soup_cli/data/_fixtures/unlearning/``). MUSE / WMDP loaders are
-    deferred to v0.61.1.
+    not yet bundled.
 
     Routes through ``importlib.resources`` (review MEDIUM M6 — matches
     v0.53.8 #93 `_bundle_source_path` policy; safe under zipapp /

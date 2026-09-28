@@ -7013,7 +7013,8 @@ class SoupConfig(BaseModel):
         - ``unlearn_method`` is rejected on any other task (silent no-op
           footgun — mirrors v0.52.0 distill / classifier task-gate).
         - ``data.forget_set`` is present when ``task='unlearn'``.
-        - Backend != mlx (live wiring deferred to v0.61.1).
+        - Backend != mlx (the MLX backend has no unlearn path;
+          use 'transformers' or 'unsloth').
         - ``loraplus_lr_ratio`` is refused (#745): unlearn drives its own
           ``torch.optim.AdamW`` loop, not a ``Trainer``, so there is nothing
           for ``attach_loraplus_optimizer`` to attach to and LoRA+ would be
