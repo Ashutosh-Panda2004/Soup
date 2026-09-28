@@ -524,11 +524,11 @@ GitHub Actions runs on every push and PR:
 
 **Pull requests run a quick subset first.** A push to a pull request runs `lint`
 and the tests on Ubuntu / Python 3.12 only. The full matrix (Windows and macOS
-as well as Ubuntu, Python 3.10 to 3.12, plus the smoke jobs) runs when a
-maintainer adds the `ci:full` label at approval, and on every later push while
-the label stays. Until then the other `test (...)` checks show as *Expected* and
-the smoke jobs as *skipped*; neither is a failure on your side. A PR is merged
-only when the full matrix is green on its current head.
+as well as Ubuntu, Python 3.10 to 3.12 with 3.11 on Ubuntu only, plus the smoke
+jobs) runs when a maintainer adds the `ci:full` label at approval, and on every
+later push while the label stays. Until then the other `test (...)` checks show
+as *Expected* and the smoke jobs as *skipped*; neither is a failure on your side.
+A PR is merged only when the full matrix is green on its current head.
 
 See `.github/workflows/ci.yml`.
 

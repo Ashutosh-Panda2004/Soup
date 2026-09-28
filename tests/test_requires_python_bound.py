@@ -10,10 +10,10 @@ The bound is derived from the CI matrix rather than hardcoded, because a floatin
 declaration and a fixed matrix drifting apart is exactly the failure this file
 exists to catch. Widening the matrix and widening the bound must happen together.
 
-The matrix is read from the `plan` job's `FULL_MATRIX` literal, the one place
-ci.yml declares it. The `test` job's own matrix is whatever `plan` outputs, which
-on a pull request without the `ci:full` label is a single cell -- a run-time
-choice, not the support statement.
+The matrix is read from the `plan` job's `RELEASE_MATRIX` literal: the support
+matrix, every cell, which pushes to `release/**` run. The `test` job's own matrix
+is whatever `plan` outputs -- FULL (the same minus Windows and macOS on 3.11) or
+a single QUICK cell -- which is a run-time choice, not the support statement.
 """
 
 import json
@@ -56,15 +56,19 @@ def _parse_bounds(spec: str) -> tuple[tuple[int, int], tuple[int, int]]:
 
 
 def _ci_python_versions() -> list[tuple[int, int]]:
-    """The `python-version` list of the full matrix the `plan` job in ci.yml declares."""
+    """The `python-version` list of the support matrix the `plan` job in ci.yml declares."""
     workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     plan = (workflow.get("jobs") or {}).get("plan") or {}
-    literal = (plan.get("env") or {}).get("FULL_MATRIX")
+    literal = (plan.get("env") or {}).get("RELEASE_MATRIX")
     assert isinstance(literal, str), (
-        "no `plan.env.FULL_MATRIX` JSON literal found in .github/workflows/ci.yml"
+        "no `plan.env.RELEASE_MATRIX` JSON literal found in .github/workflows/ci.yml"
     )
-    versions = json.loads(literal).get("python-version")
-    assert versions, "the full matrix has an empty python-version list"
+    matrix = json.loads(literal)
+    assert not {"exclude", "include"} & set(matrix), (
+        "the support matrix must be a plain product, or a listed Python may run nowhere"
+    )
+    versions = matrix.get("python-version")
+    assert versions, "the support matrix has an empty python-version list"
     parsed = []
     for version in versions:
         assert isinstance(version, str), (

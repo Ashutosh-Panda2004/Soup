@@ -2,17 +2,23 @@
 
 Measured 2026-09-28 07:30Z: the Actions account sat at its free-plan cap of 20
 concurrent jobs (8 ubuntu, 8 windows, 4 macos) with 301 jobs queued, and every
-push to a pull request cost 15 jobs of ``ci.yml``. So a push to a pull request
-now runs ``lint`` plus ONE test cell, ``test (ubuntu-latest, 3.12)``. The other
-eight cells and the five smoke / contract jobs run on pushes to ``main`` and
-``release/**``, and on a pull request a maintainer has labelled ``ci:full``.
+push to a pull request cost 15 jobs of ``ci.yml``. So ``plan`` picks one of
+three matrices by event:
+
+* RELEASE, every cell of the 3x3 support matrix, for pushes to ``release/**``
+  -- the release checklist needs all of them green on the tagged commit;
+* FULL, the same minus Windows and macOS on 3.11, for pushes to ``main`` and
+  pull requests a maintainer has labelled ``ci:full``;
+* QUICK, ``test (ubuntu-latest, 3.12)`` alone, for any other pull-request run.
 
 The merge gate survives that because of one shape, and these tests pin it: the
 ``test`` job's matrix is whatever the ``plan`` job outputs, so a quick run never
-CREATES the other eight required ``test (...)`` contexts. Branch protection
+CREATES the other six required ``test (...)`` contexts. Branch protection
 passes a skipped job and waits on a missing one, so it is the missing cells --
 not the skipped smokes -- that keep the merge button locked until the full
-matrix has run.
+matrix has run. FULL must name exactly the required contexts: a cell it drops
+that branch protection still requires would lock every merge, and a required
+cell it drops silently would stop being tested before merge at all.
 
 Nothing here talks to GitHub. The workflow is read as YAML, the ``plan`` step's
 shell runs under a local bash, and the expressions GitHub would evaluate are
@@ -46,28 +52,35 @@ GATED_JOBS = (
     "pytorch-smoke",
     "transformers-floor",
 )
+#: The support matrix: what RELEASE runs, and what requires-python must match.
 SUPPORT_MATRIX = {
     "os": ["ubuntu-latest", "windows-latest", "macos-latest"],
     "python-version": ["3.10", "3.11", "3.12"],
 }
+#: What FULL leaves out of it. 3.11 still runs on ubuntu in every full run.
+FULL_EXCLUDE = (
+    {"os": "windows-latest", "python-version": "3.11"},
+    {"os": "macos-latest", "python-version": "3.11"},
+)
 QUICK_MATRIX = {"os": ["ubuntu-latest"], "python-version": ["3.12"]}
-#: The nine ``test`` contexts branch protection on ``main`` requires, read on
+#: The seven ``test`` contexts branch protection on ``main`` requires, read on
 #: 2026-09-28 with ``gh api repos/MakazhanAlpamys/Soup/branches/main/protection/
-#: required_status_checks`` (the other four are lint, mlx-smoke, pytorch-smoke and
-#: transformers-floor). A cell named any other way is a context nobody waits on.
+#: required_status_checks`` after the owner dropped Windows and macOS 3.11 (11
+#: required checks: these plus lint, mlx-smoke, pytorch-smoke, transformers-floor).
+#: A cell named any other way is a context nobody waits on.
 REQUIRED_TEST_CONTEXTS = frozenset(
     {
         "test (ubuntu-latest, 3.10)",
         "test (ubuntu-latest, 3.11)",
         "test (ubuntu-latest, 3.12)",
         "test (windows-latest, 3.10)",
-        "test (windows-latest, 3.11)",
         "test (windows-latest, 3.12)",
         "test (macos-latest, 3.10)",
-        "test (macos-latest, 3.11)",
         "test (macos-latest, 3.12)",
     }
 )
+#: The two cells only a push to ``release/**`` runs. Not required, so not a merge gate.
+RELEASE_ONLY_CONTEXTS = frozenset({"test (windows-latest, 3.11)", "test (macos-latest, 3.11)"})
 
 
 # --- Reading the workflow ----------------------------------------------------
@@ -106,28 +119,45 @@ def _decide_step() -> dict[str, Any]:
     return steps[0]
 
 
-def _full_literal() -> str:
-    literal = (_plan().get("env") or {}).get("FULL_MATRIX")
+MATRIX_NAMES = ("RELEASE_MATRIX", "FULL_MATRIX", "QUICK_MATRIX")
+
+
+def _literal(name: str) -> str:
+    literal = (_plan().get("env") or {}).get(name)
     assert isinstance(literal, str), (
-        "the plan job must declare the support matrix once, as the JSON literal "
-        "env.FULL_MATRIX"
+        f"the plan job must declare {name} once, as a JSON literal in its env"
     )
     return literal
 
 
-def _quick_literal() -> str:
-    literal = (_decide_step().get("env") or {}).get("QUICK_MATRIX")
-    assert isinstance(literal, str), "the decide step must declare env.QUICK_MATRIX"
-    return literal
+def _matrix(name: str) -> dict[str, Any]:
+    return json.loads(_literal(name))
 
 
-def _context_names(matrix: dict[str, list[str]]) -> set[str]:
-    """What GitHub titles each cell: the values in key order, os first."""
-    return {
-        f"test ({runner}, {python})"
-        for runner in matrix["os"]
-        for python in matrix["python-version"]
-    }
+def _cells(matrix: dict[str, Any]) -> set[str]:
+    """The ``test (...)`` contexts GitHub creates for *matrix*.
+
+    The product of the two axes, titled with the values in key order (os first),
+    minus every cell an ``exclude`` entry matches -- GitHub excludes on a PARTIAL
+    match, so ``{"python-version": "3.11"}`` alone would drop all three 3.11 cells.
+    """
+    assert set(matrix) <= {"os", "python-version", "exclude"}, sorted(matrix)
+    names = set()
+    for runner in matrix["os"]:
+        for python in matrix["python-version"]:
+            cell = {"os": runner, "python-version": python}
+            if any(
+                all(cell.get(key) == value for key, value in rule.items())
+                for rule in matrix.get("exclude", [])
+            ):
+                continue
+            names.add(f"test ({runner}, {python})")
+    return names
+
+
+def _rules(entries: Any) -> list[tuple[tuple[str, Any], ...]]:
+    """Exclude entries compared as a multiset, whatever order they are listed in."""
+    return sorted(tuple(sorted(entry.items())) for entry in entries)
 
 
 def _version(text: str) -> tuple[int, ...]:
@@ -138,11 +168,11 @@ def _version(text: str) -> tuple[int, ...]:
 #
 # It covers exactly what ci.yml's concurrency key and the plan decision use:
 # string literals, true/false/null, property paths (with one `*` object
-# filter), parentheses, ! == != && || and the functions format() and
-# contains(). The semantics are GitHub's: && and || return an OPERAND, not a
-# boolean; ! binds tighter than == and !=, which bind tighter than &&, then ||;
-# strings compare case-insensitively; a missing property is null. Anything else
-# fails loudly instead of being guessed at.
+# filter), parentheses, ! == != && || and the functions format(), contains()
+# and startsWith(). The semantics are GitHub's: && and || return an OPERAND,
+# not a boolean; ! binds tighter than == and !=, which bind tighter than &&,
+# then ||; strings compare case-insensitively; a missing property is null.
+# Anything else fails loudly instead of being guessed at.
 
 _TOKEN = re.compile(
     r"(?P<string>'(?:[^']|'')*')"
@@ -217,6 +247,9 @@ def _call(name: str, args: list[Any]) -> Any:
         if isinstance(haystack, list):
             return any(_equal(item, needle) for item in haystack)
         return _text(needle).casefold() in _text(haystack).casefold()
+    if function == "startswith" and len(args) == 2:
+        text, prefix = args
+        return _text(text).casefold().startswith(_text(prefix).casefold())
     raise AssertionError(f"{name}() is not modelled by this test's evaluator; add it to _call()")
 
 
@@ -354,6 +387,28 @@ def _full_for(context: dict[str, Any]) -> str:
     return _render(_decide_step()["env"]["FULL"], context)
 
 
+def _release_for(context: dict[str, Any]) -> str:
+    return _render(_decide_step()["env"]["RELEASE"], context)
+
+
+#: Which matrix each event must get: the one table both the expression tests and
+#: the end-to-end run of the step's shell read.
+EVENTS = [
+    pytest.param(_push("refs/heads/main"), "FULL", id="push-main"),
+    pytest.param(_push("refs/heads/release/v0.76.0"), "RELEASE", id="push-release"),
+    pytest.param(_pull_request("opened"), "QUICK", id="pr-opened"),
+    pytest.param(_pull_request("synchronize", labels=("bug",)), "QUICK", id="pr-push-other-label"),
+    pytest.param(_pull_request("synchronize", labels=("bug", LABEL)), "FULL", id="pr-push-ci-full"),
+    pytest.param(_pull_request("labeled", label=LABEL), "FULL", id="adds-ci-full"),
+    pytest.param(_pull_request("labeled", label="bug"), "QUICK", id="adds-other"),
+    pytest.param(
+        _pull_request("labeled", label="bug", labels=(LABEL,)),
+        "FULL",
+        id="adds-other-while-ci-full",
+    ),
+]
+
+
 # --- Tests -------------------------------------------------------------------
 
 
@@ -382,9 +437,15 @@ class TestTheEvaluatorHasTeeth:
         rendered = _render("${{ github.workflow }}-${{ format('x-{0}', github.run_id) }}", context)
         assert rendered == "CI-x-42"
 
+    def test_starts_with_is_a_case_insensitive_prefix_test(self):
+        context = {"github": {"ref": "refs/heads/Release/v1"}}
+        assert _Expression("startsWith(github.ref, 'refs/heads/release/')", context).value()
+        assert not _Expression("startsWith(github.ref, 'refs/heads/main')", context).value()
+        assert not _Expression("startsWith(github.nothing, 'refs/')", context).value()
+
     def test_what_it_does_not_model_fails_instead_of_guessing(self):
         with pytest.raises(AssertionError, match="not modelled"):
-            _Expression("startsWith(github.ref, 'x')", {}).value()
+            _Expression("toJSON(github)", {}).value()
         with pytest.raises(AssertionError, match="does not know"):
             _Expression("github.run_number >= 2", {}).value()
 
@@ -417,29 +478,12 @@ class TestPlanDecision:
             "matrix": "${{ steps.decide.outputs.matrix }}",
         }
 
-    @pytest.mark.parametrize(
-        ("context", "expected"),
-        [
-            pytest.param(_push("refs/heads/main"), "true", id="push-main"),
-            pytest.param(_push("refs/heads/release/v0.76.0"), "true", id="push-release"),
-            pytest.param(_pull_request("opened"), "false", id="pr-opened"),
-            pytest.param(
-                _pull_request("synchronize", labels=("bug",)), "false", id="pr-push-other-label"
-            ),
-            pytest.param(
-                _pull_request("synchronize", labels=("bug", LABEL)), "true", id="pr-push-ci-full"
-            ),
-            pytest.param(_pull_request("labeled", label=LABEL), "true", id="adds-ci-full"),
-            pytest.param(_pull_request("labeled", label="bug"), "false", id="adds-other"),
-            pytest.param(
-                _pull_request("labeled", label="bug", labels=(LABEL,)),
-                "true",
-                id="adds-other-while-ci-full",
-            ),
-        ],
-    )
-    def test_full_follows_the_event_and_the_current_labels(self, context, expected):
-        assert _full_for(context) == expected
+    @pytest.mark.parametrize(("context", "kind"), EVENTS)
+    def test_the_decision_follows_the_event_and_the_current_labels(self, context, kind):
+        """RELEASE only for a push to release/**; FULL for any other push and for a pull
+        request whose CURRENT labels carry ci:full, whichever event started the run."""
+        assert _release_for(context) == ("true" if kind == "RELEASE" else "false")
+        assert _full_for(context) == ("false" if kind == "QUICK" else "true")
 
 
 class TestGatedJobs:
@@ -461,7 +505,7 @@ class TestGatedJobs:
 
 class TestMatrix:
     def test_the_test_job_takes_its_matrix_from_plan(self):
-        """A static matrix with a per-cell `if:` would SKIP the eight cells, and a skipped
+        """A static matrix with a per-cell `if:` would SKIP the missing cells, and a skipped
         job passes branch protection; a matrix from plan never creates them."""
         test = _jobs()["test"]
         assert "plan" in _needs(test)
@@ -470,30 +514,43 @@ class TestMatrix:
         assert test["strategy"]["matrix"] == "${{ fromJSON(needs.plan.outputs.matrix) }}"
         assert test["runs-on"] == "${{ matrix.os }}"
 
-    def test_the_full_matrix_is_the_support_matrix(self):
-        full = json.loads(_full_literal())
-        assert full == SUPPORT_MATRIX
-        assert list(full) == ["os", "python-version"], "the key order names the check contexts"
-        assert all(isinstance(python, str) for python in full["python-version"]), (
+    def test_release_is_the_support_matrix_with_nothing_excluded(self):
+        release = _matrix("RELEASE_MATRIX")
+        assert release == SUPPORT_MATRIX, "RELEASE must be every cell: no exclude, no include"
+        assert list(release) == ["os", "python-version"], "the key order names the checks"
+        assert all(isinstance(python, str) for python in release["python-version"]), (
             "a JSON number 3.10 is 3.1, which renames the check context"
         )
 
-    def test_the_full_matrix_names_the_nine_required_test_contexts(self):
-        assert _context_names(json.loads(_full_literal())) == REQUIRED_TEST_CONTEXTS
+    def test_full_is_the_support_matrix_minus_exactly_two_cells(self):
+        full = _matrix("FULL_MATRIX")
+        assert list(full) == ["os", "python-version", "exclude"]
+        assert full["os"] == SUPPORT_MATRIX["os"]
+        assert full["python-version"] == SUPPORT_MATRIX["python-version"]
+        assert _rules(full["exclude"]) == _rules(FULL_EXCLUDE)
+        # Nothing else excluded, whatever the entries look like (a partial rule
+        # such as {"python-version": "3.11"} would drop the ubuntu cell too).
+        assert _cells(_matrix("RELEASE_MATRIX")) - _cells(full) == RELEASE_ONLY_CONTEXTS
+
+    def test_full_names_exactly_the_required_test_contexts(self):
+        assert _cells(_matrix("FULL_MATRIX")) == REQUIRED_TEST_CONTEXTS
+
+    def test_release_runs_every_required_cell_and_the_two_full_skips(self):
+        assert _cells(_matrix("RELEASE_MATRIX")) == REQUIRED_TEST_CONTEXTS | RELEASE_ONLY_CONTEXTS
 
     def test_the_quick_matrix_is_the_newest_python_on_ubuntu(self):
-        quick = json.loads(_quick_literal())
+        quick = _matrix("QUICK_MATRIX")
         assert quick == QUICK_MATRIX
         assert list(quick) == ["os", "python-version"]
-        names = _context_names(quick)
+        names = _cells(quick)
         assert len(names) == 1 and names <= REQUIRED_TEST_CONTEXTS
-        full_pythons = json.loads(_full_literal())["python-version"]
-        assert quick["python-version"] == [max(full_pythons, key=_version)]
+        support_pythons = SUPPORT_MATRIX["python-version"]
+        assert quick["python-version"] == [max(support_pythons, key=_version)]
 
-    def test_the_matrix_literals_are_single_lines(self):
+    @pytest.mark.parametrize("name", MATRIX_NAMES)
+    def test_the_matrix_literals_are_single_lines(self, name):
         """$GITHUB_OUTPUT takes one `name=value` per line; a newline would end the value."""
-        assert "\n" not in _full_literal()
-        assert "\n" not in _quick_literal()
+        assert "\n" not in _literal(name)
 
 
 class TestConcurrency:
@@ -565,7 +622,8 @@ BASH = _posix_bash()
 class TestTheDecideStepScript:
     """Run the plan step's own shell, as the runner would, against a fake $GITHUB_OUTPUT."""
 
-    def _outputs(self, tmp_path: Path, full: str) -> list[str]:
+    def _outputs(self, tmp_path: Path, *, release: str, full: str) -> tuple[str, Any]:
+        """Run the step with the given decision values; return (full, parsed matrix)."""
         assert BASH is not None
         output = tmp_path / "github_output"
         output.write_text("", encoding="utf-8")
@@ -573,9 +631,9 @@ class TestTheDecideStepScript:
         script.write_bytes(_decide_step()["run"].encode("utf-8"))
         env = {
             **os.environ,
+            **{name: _literal(name) for name in MATRIX_NAMES},
+            "RELEASE": release,
             "FULL": full,
-            "FULL_MATRIX": _full_literal(),
-            "QUICK_MATRIX": _quick_literal(),
             "GITHUB_OUTPUT": output.as_posix(),
         }
         result = subprocess.run(
@@ -588,26 +646,38 @@ class TestTheDecideStepScript:
             check=False,
         )
         assert result.returncode == 0, (result.stdout, result.stderr)
-        return output.read_text(encoding="utf-8").splitlines()
-
-    def test_a_full_run_outputs_the_support_matrix(self, tmp_path):
-        lines = self._outputs(tmp_path, "true")
+        lines = output.read_text(encoding="utf-8").splitlines()
         assert len(lines) == 2, lines
-        assert lines[0] == "full=true"
-        key, _, value = lines[1].partition("=")
-        assert key == "matrix"
-        assert json.loads(value) == SUPPORT_MATRIX
+        full_key, _, full_value = lines[0].partition("=")
+        matrix_key, _, matrix_value = lines[1].partition("=")
+        assert (full_key, matrix_key) == ("full", "matrix"), lines
+        return full_value, json.loads(matrix_value)
 
-    @pytest.mark.parametrize("full", ["false", "", "yes"])
-    def test_anything_but_true_is_the_quick_subset(self, tmp_path, full):
+    @pytest.mark.parametrize(("context", "kind"), EVENTS)
+    def test_each_event_gets_its_matrix(self, tmp_path, context, kind):
+        """End to end: the event, through GitHub's expressions, through the shell."""
+        full, matrix = self._outputs(
+            tmp_path, release=_release_for(context), full=_full_for(context)
+        )
+        assert matrix == _matrix(f"{kind}_MATRIX")
+        assert full == ("false" if kind == "QUICK" else "true")
+
+    @pytest.mark.parametrize(
+        ("release", "full", "kind"),
+        [
+            ("false", "false", "QUICK"),
+            ("false", "", "QUICK"),
+            ("false", "yes", "QUICK"),
+            ("", "true", "FULL"),
+            ("yes", "true", "FULL"),
+        ],
+    )
+    def test_only_the_exact_string_true_selects(self, tmp_path, release, full, kind):
         """Quick is the fail-closed answer on a pull request: fewer cells, more missing
         required contexts, a locked merge button."""
-        lines = self._outputs(tmp_path, full)
-        assert len(lines) == 2, lines
-        assert lines[0] == "full=false"
-        key, _, value = lines[1].partition("=")
-        assert key == "matrix"
-        assert json.loads(value) == QUICK_MATRIX
+        flag, matrix = self._outputs(tmp_path, release=release, full=full)
+        assert matrix == _matrix(f"{kind}_MATRIX")
+        assert flag == ("false" if kind == "QUICK" else "true")
 
 
 def test_contributing_tells_contributors_about_the_label():
