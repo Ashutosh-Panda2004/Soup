@@ -77,29 +77,23 @@ def summarize_training_loss(
             continue
         mean_loss = _finite_loss(entry["train_loss"])
         if mean_loss is not None:
-            return _tag(
-                {
-                    "initial_loss": mean_loss,
-                    "final_loss": mean_loss,
-                    "loss_summary_kind": "mean",
-                }
-            )
+            return {
+                "initial_loss": mean_loss,
+                "final_loss": mean_loss,
+                "loss_summary_kind": "mean",
+            }
 
     if final_metrics is not None and "train_loss" in final_metrics:
         mean_loss = _finite_loss(final_metrics["train_loss"])
         if mean_loss is not None:
-            return _tag(
-                {
-                    "initial_loss": mean_loss,
-                    "final_loss": mean_loss,
-                    "loss_summary_kind": "mean",
-                }
-            )
+            return {
+                "initial_loss": mean_loss,
+                "final_loss": mean_loss,
+                "loss_summary_kind": "mean",
+            }
 
-    return _tag(
-        {
-            "initial_loss": 0.0,
-            "final_loss": 0.0,
-            "loss_summary_kind": "unavailable",
-        }
-    )
+    return {
+        "initial_loss": 0.0,
+        "final_loss": 0.0,
+        "loss_summary_kind": "unavailable",
+    }

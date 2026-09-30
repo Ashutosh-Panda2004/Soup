@@ -76,11 +76,13 @@ def _format_training_complete_loss(result: dict) -> str:
     summary_kind = result.get("loss_summary_kind")
     if summary_kind == "unavailable":
         return "Loss: [bold]unavailable[/]"
+    loss_key = result.get("loss_key")
+    label = f" [dim]({loss_key})[/]" if isinstance(loss_key, str) else ""
     if summary_kind in {"mean", "single"} or (
         summary_kind is None and result["initial_loss"] == result["final_loss"]
     ):
-        return f"Loss: [bold]{result['final_loss']:.4f}[/]"
-    return f"Loss: [bold]{result['initial_loss']:.4f} -> {result['final_loss']:.4f}[/]"
+        return f"Loss: [bold]{result['final_loss']:.4f}[/]{label}"
+    return f"Loss: [bold]{result['initial_loss']:.4f} -> {result['final_loss']:.4f}[/]{label}"
 
 
 def _train_sample_count(dcfg, dataset) -> int:

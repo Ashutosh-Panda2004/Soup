@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from soup_cli.trainer.loss_summary import summarize_training_loss
 
@@ -86,3 +87,114 @@ def test_ppo_trainer_declares_the_policy_avg_key():
         )
     ]
     assert len(declaring_calls) == 1
+
+
+def _trl_029_ppo_entry(step, policy_loss):
+    """One ``state.log_history`` entry exactly as trl 0.29.1's PPOTrainer writes it.
+
+    Keys read from ``ppo_trainer.py:883-901``: the per-step policy loss lives
+    under ``loss/policy_avg`` and there is no ``loss`` key.
+    """
+    return {
+        "eps": 3,
+        "objective/kl": 9.4,
+        "objective/entropy": 41.0,
+        "objective/non_score_reward": -0.5,
+        "objective/rlhf_reward": 0.2,
+        "objective/scores": 0.7,
+        "policy/approxkl_avg": 0.001,
+        "policy/clipfrac_avg": 0.0,
+        "loss/policy_avg": policy_loss,
+        "loss/value_avg": 0.3,
+        "val/clipfrac_avg": 0.0,
+        "policy/entropy_avg": 1.9,
+        "val/ratio": 1.0,
+        "val/ratio_var": 0.0,
+        "val/num_eos_tokens": 2,
+        "lr": 1e-05,
+        "episode": step * 4,
+        "epoch": 0.1,
+        "step": step,
+    }
+
+
+def test_train_builtin_reports_the_ppo_policy_loss_not_unavailable():
+    """The trl path must feed its real ``log_history`` under the declared key.
+
+    The AST guard above counts a declaring call anywhere in ``ppo.py``; this
+    drives ``_train_builtin`` on a mock trl trainer so a wiring slip (key on
+    the wrong call, wrong history fed to the summary) fails here instead.
+    Passes on the fix, fails on ``main`` (``assert 'unavailable' == 'delta'``).
+    """
+    from soup_cli.config.schema import SoupConfig
+    from soup_cli.trainer.ppo import PPOTrainerWrapper
+
+    cfg = SoupConfig(base="test-model", task="ppo", data={"train": "./data.jsonl"})
+    wrapper = PPOTrainerWrapper(cfg, device="cpu")
+    wrapper._output_dir = "/tmp/test"
+    wrapper._dataset_in_constructor = True
+    wrapper._train_ds = MagicMock()
+
+    trainer = MagicMock()
+    # a real callable with no params, like trl's PPOTrainer.train
+    trainer.train = lambda: None
+    trainer.state.log_history = [_trl_029_ppo_entry(1, 1.42), _trl_029_ppo_entry(2, 0.87)]
+    trainer.state.global_step = 2
+    wrapper.trainer = trainer
+    wrapper.tokenizer = MagicMock()
+
+    result = wrapper._train_builtin(
+        display=None, tracker=None, run_id="", resume_from_checkpoint=None
+    )
+
+    assert result["loss_summary_kind"] == "delta"
+    assert result["initial_loss"] == 1.42
+    assert result["final_loss"] == 0.87
+    assert result["loss_key"] == "loss/policy_avg"
+
+
+def test_ppo_panel_names_the_declared_loss_key():
+    """The completion panel says which quantity the number is.
+
+    A PPO policy loss is not comparable to an SFT cross-entropy, so the panel
+    labels the value instead of printing a bare ``Loss: a -> b``.
+    """
+    from soup_cli.commands.train import _format_training_complete_loss
+
+    rendered = _format_training_complete_loss(
+        {
+            "initial_loss": 1.42,
+            "final_loss": 0.87,
+            "loss_summary_kind": "delta",
+            "loss_key": "loss/policy_avg",
+        }
+    )
+    assert rendered == "Loss: [bold]1.4200 -> 0.8700[/] [dim](loss/policy_avg)[/]"
+
+
+def test_ppo_panel_labels_the_single_step_value_too():
+    from soup_cli.commands.train import _format_training_complete_loss
+
+    rendered = _format_training_complete_loss(
+        {
+            "initial_loss": 1.42,
+            "final_loss": 1.42,
+            "loss_summary_kind": "single",
+            "loss_key": "loss/policy_avg",
+        }
+    )
+    assert rendered == "Loss: [bold]1.4200[/] [dim](loss/policy_avg)[/]"
+
+
+def test_unavailable_panel_stays_bare():
+    from soup_cli.commands.train import _format_training_complete_loss
+
+    rendered = _format_training_complete_loss(
+        {
+            "initial_loss": 0.0,
+            "final_loss": 0.0,
+            "loss_summary_kind": "unavailable",
+            "loss_key": "loss/policy_avg",
+        }
+    )
+    assert rendered == "Loss: [bold]unavailable[/]"
